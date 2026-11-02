@@ -2,7 +2,7 @@
 // @id             iitc-plugin-tencent-maps@tabris@szres
 // @name           IITC plugin: Tencent Maps base layers (腾讯地图底图)
 // @category       Map Tiles
-// @version        0.4.0.20261103
+// @version        0.5.0.20261103
 // @namespace      tabris@szres
 // @author         tabris@szres
 // @description    Adds Tencent Maps and Esri World Imagery base layers to IITC: street / dark / silver / satellite / satellite+roads / terrain / Esri satellite, using the current rt*.map.gtimg.com tile API. 为 IITC 添加腾讯地图与 Esri 卫星底图：标准、深色、浅灰、卫星、卫星（路网）、地形、Esri 卫星。使用腾讯地图当前官方瓦片接口 rt*.map.gtimg.com/tile。
@@ -20,6 +20,10 @@
 /* global L, map -- eslint */
 
 // —— 版本历史 ——
+// 0.5.0  新增「腾讯地图（大字）」「腾讯地图（深色·大字）」图层：tileSize 512 + 请求 z-1，
+//        字号为标准版的 2 倍；瓦片尺寸逻辑重构为统一的 scale 推导
+//        （nativeMin/nativeMax → tileSize / zoomOffset / maxNativeZoom / minNativeZoom），
+//        彻底消除 maxNativeZoom 被算成 NaN 的可能。
 // 0.4.0  修复高清模式下 Esri 图层 maxNativeZoom 被算成 NaN 导致放大后请求空白瓦片；
 //        图层选择器增加旧版 IITC 兼容与暗色主题标记；AUTO_SELECT 改用 layerChooser.show；
 //        元数据清理（去掉与 @match 重复的 @include、@namespace 改为作者自己的仓库）。
@@ -73,14 +77,19 @@ function wrapper(plugin_info) {
   self.TILE_VERSION = 2232; // confinfo.map.qq.com 当前下发的矢量瓦片版本号
   self.SESSION_ID = Date.now(); // 会话级缓存指纹（见 _buildUrl 内说明）
 
-  // 高清瓦片开关：
+  // 高清瓦片开关（影响"标准"图层的字号观感）：
   //   'auto'（默认）—— 高分屏（Windows 显示缩放 125%/150% 等，devicePixelRatio>1.05）
-  //                    自动请求 z+1 瓦片并按半尺寸渲染，密度翻倍，文字明显更清晰；
-  //   true           —— 无论什么屏幕都强制高清（标准屏也有抗锯齿收益，但瓦片请求数 ×4）；
-  //   false          —— 关闭，始终使用 256px 原生瓦片。
+  //                    自动请求 z+1 瓦片并按半尺寸渲染：像素密度翻倍更锐利，
+  //                    但注意字号会变成一半（因为显示的是缩小后的下一层级瓦片）；
+  //   true           —— 无论什么屏幕都强制高清（瓦片请求数 ×4）；
+  //   false          —— 关闭，使用 256px 原生瓦片，字号 1:1（觉得字小的另一个解法）。
+  //
+  // 若觉得字太小，最省事的办法是直接选图层里的「腾讯地图（大字）」：
+  // 它固定 scale=2（请求 z-1、按 512px 渲染），字号是标准版的 2 倍，不受本开关影响。
   self.HD_TILES = 'auto';
 
-  // 设为 'street' / 'dark' / 'silver' / 'satellite' / 'hybrid' / 'esri' / 'terrain'
+  // 设为 'street' / 'streetBig' / 'dark' / 'darkBig' / 'silver' /
+  //       'satellite' / 'hybrid' / 'esri' / 'terrain'
   // 可在插件加载后自动切换为默认底图；保持 null 则仅在图层选择器中注册，手动选择。
   self.AUTO_SELECT = null;
 
@@ -91,25 +100,40 @@ function wrapper(plugin_info) {
       // 若把 L.TileLayer.extend 放在脚本顶层，油猴注入时序可能先于 IITC 加载，
       // 导致 "L is not defined" 报错、插件静默失效。
       //
-      // 高清瓦片设置（腾讯图层与 Esri 图层共用）。
-      // 原理：tileSize 128 + zoomOffset 1 → 请求 z+1 级瓦片，但每张仍按 128 CSS px
-      // 渲染，于是在 DPR=2 的屏幕上 256px 的原图正好铺满 256 设备像素，做到 1:1 不放大。
-      // maxNativeZoom 必须同步 -1，否则 Leaflet 会把 _tileZoom 钳到原生上限后
-      // 再加 zoomOffset，从而去请求 z19（腾讯/Esri 都没有，返回占位空白图）。
-      function applyHd(options) {
+      // —— 瓦片渲染尺寸（scale）——
+      // 实测腾讯各层级瓦片都是 256×256，所以"字看着多大"完全由 tileSize 决定：
+      //   scale = 2   → tileSize 512 + zoomOffset -1：请求 z-1 瓦片、按 512px 渲染
+      //                 → 字号 ×2，代价是细节降一层、边缘略糊（"大字"图层用这个）
+      //   scale = 1   → tileSize 256 + zoomOffset  0：原生，字号 1:1
+      //   scale = 0.5 → tileSize 128 + zoomOffset +1：请求 z+1 瓦片、按 128px 渲染
+      //                 → 像素密度翻倍更锐利，但字号只有一半（高分屏默认走这个，
+      //                   这也是"高分屏下觉得字变小了"的根因）
+      // 三个参数必须联动，否则会请求到不存在的层级（返回占位空白图）：
+      //   URL z = clamp(地图缩放, minNativeZoom, maxNativeZoom) + zoomOffset
+      //   → maxNativeZoom = nativeMax - zoomOffset
+      //   → minNativeZoom = nativeMin - zoomOffset
+      // 所以图层只需声明 nativeMin / nativeMax 两个"真实层级上限"，其余自动推导。
+      function resolveScale(explicit) {
+        if (typeof explicit === 'number' && explicit > 0) return explicit;
         var dpr = window.devicePixelRatio || 1;
         var hd = (self.HD_TILES === true) ||
                  (self.HD_TILES !== false && dpr > 1.05);
-        if (hd) {
-          if (typeof options.maxNativeZoom !== 'number') {
-            // 兜底：拿不到原生上限就退回普通瓦片，绝不让 NaN 流进 Leaflet
-            console.warn('[tencent-maps] maxNativeZoom 缺失，已跳过高清模式');
-            return options;
-          }
-          options.tileSize = 128;
-          options.zoomOffset = 1;
-          options.maxNativeZoom -= 1;
+        return hd ? 0.5 : 1;
+      }
+
+      function applyScale(options) {
+        var scale = resolveScale(options.scale);
+        var zoomOffset = -Math.round(Math.log(scale) / Math.LN2);
+        if (typeof options.nativeMax !== 'number' || typeof options.nativeMin !== 'number') {
+          // 兜底：拿不到原生层级就按 1:1 处理，绝不让 NaN 流进 Leaflet
+          console.warn('[tencent-maps] nativeMax/nativeMin 缺失，已跳过缩放调整');
+          return options;
         }
+        options.scale = scale;
+        options.tileSize = 256 * scale;
+        options.zoomOffset = zoomOffset;
+        options.maxNativeZoom = options.nativeMax - zoomOffset;
+        options.minNativeZoom = Math.max(0, options.nativeMin - zoomOffset);
         return options;
       }
 
@@ -117,16 +141,19 @@ function wrapper(plugin_info) {
         options: {
           subdomains: ['0', '1', '2', '3'],
           minZoom: 3,
-          maxNativeZoom: 18,
+          nativeMin: 3,
+          nativeMax: 18,
+          scale: null, // null = 跟随 HD_TILES 自动判定；2 = 大字；1 = 原生；0.5 = 高清
           needFixChinaOffset: true, // 供 fix-china-map-offset 插件识别
           attribution: '© 腾讯地图'
         },
         initialize: function (options) {
           options = L.extend({
-            maxNativeZoom: 18, // 类默认值：显式写出以便高清模式下正确 -1
+            nativeMin: 3, // 实测 z=3 可用（官方声明 minZoom=4）
+            nativeMax: 18, // 矢量瓦片原生上限
             maxZoom: (typeof map !== 'undefined' && map.options && map.options.maxZoom) || 21
           }, options);
-          L.TileLayer.prototype.initialize.call(this, '', applyHd(options));
+          L.TileLayer.prototype.initialize.call(this, '', applyScale(options));
         },
         getTileUrl: function (coords) {
           var z = this._getZoomForUrl();
@@ -167,62 +194,60 @@ function wrapper(plugin_info) {
       var EsriImageryLayer = L.TileLayer.extend({
         options: {
           minZoom: 2,
-          maxNativeZoom: 19, // 实测中国城市原生细节到 z19，z20 起为空白占位图
+          nativeMin: 2,
+          nativeMax: 19, // 实测中国城市原生细节到 z19，z20 起为空白占位图
           needFixChinaOffset: false,
           attribution: '© Esri, Maxar, Earthstar Geographics'
         },
         initialize: function (options) {
           options = L.extend({
-            // FIX(0.4.0)：这里必须显式给 maxNativeZoom，否则 applyHd 里
-            // options.maxNativeZoom 为 undefined，减一得到 NaN 覆盖掉原型上的 19，
-            // Leaflet 的 _clampZoom 判断 NaN 恒为 false → 不再钳制层级，
-            // 高分屏下会一路请求到 z21/z22，拿到的是"无数据"空白瓦片。
-            maxNativeZoom: 19,
+            // 必须显式给 nativeMin/nativeMax：早期版本这里漏了上限，
+            // 高清模式下 undefined - 1 得到 NaN 覆盖掉原型值，
+            // Leaflet 的 _clampZoom 对 NaN 恒不钳制 → 一路请求到 z21/z22 的空白瓦片。
+            nativeMin: 2,
+            nativeMax: 19,
             maxZoom: (typeof map !== 'undefined' && map.options && map.options.maxZoom) || 21
           }, options);
           L.TileLayer.prototype.initialize.call(this,
             'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-            applyHd(options));
+            applyScale(options));
         }
       });
 
       function mark(layer) { layer._tencentMaps = true; return layer; }
-      function vec(styleid) {
-        return mark(new TencentVectorLayer({ styleid: styleid }));
+      function vec(styleid, extra) {
+        return mark(new TencentVectorLayer(L.extend({ styleid: styleid }, extra)));
       }
-      function grid(dir, ext, maxNative) {
-        return mark(new TencentGridLayer({ tileDir: dir, tileExt: ext, maxNativeZoom: maxNative }));
+      function grid(dir, ext, nativeMax, extra) {
+        return mark(new TencentGridLayer(L.extend({ tileDir: dir, tileExt: ext, nativeMax: nativeMax }, extra)));
       }
 
       var satellite = grid('sateTiles', '.jpg', 18);
       // 卫星混合 = 卫星影像 + 透明路网标注层（styleid=2）
       var hybrid = L.layerGroup([
         satellite,
-        mark(new TencentVectorLayer({ styleid: 2, attribution: '', maxNativeZoom: 18 }))
+        mark(new TencentVectorLayer({ styleid: 2, attribution: '', nativeMax: 18 }))
       ]);
       mark(hybrid); // 组本身也打标记，便于 AUTO_SELECT 判定"这是自己的图层"
 
-      // [图层, 名称, 是否暗色]——第三项交给 IITC-CE 的图层选择器，
-      // 暗色主题下可以自动优先选深色底图（0.4.0 新增）。
+      // 每项：[key, 图层, 显示名, 是否暗色]
+      // 「大字」版用 scale: 2（tileSize 512 + 请求 z-1），字号是标准版的 2 倍，
+      // 适合高分屏/高分屏缩放后觉得字太小的情况；代价是细节降一层、边缘略糊。
+      // 卫星/地形没有文字标注，放大只会更糊，所以不提供大字版。
       var layers = [
-        [vec(0), '腾讯地图', false],
-        [vec(3), '腾讯地图（深色）', true],
-        [vec(4), '腾讯地图（浅灰）', false],
-        [satellite, '腾讯卫星', true],
-        [hybrid, '腾讯卫星（路网）', true],
-        [new EsriImageryLayer(), 'Esri 卫星', true],
-        [grid('demTiles', '.png', 15), '腾讯地形', false]
+        ['street',    vec(0),                       '腾讯地图',             false],
+        ['streetBig', vec(0, { scale: 2 }),         '腾讯地图（大字）',      false],
+        ['dark',      vec(3),                       '腾讯地图（深色）',      true],
+        ['darkBig',   vec(3, { scale: 2 }),         '腾讯地图（深色·大字）', true],
+        ['silver',    vec(4),                       '腾讯地图（浅灰）',      false],
+        ['satellite', satellite,                    '腾讯卫星',             true],
+        ['hybrid',    hybrid,                       '腾讯卫星（路网）',      true],
+        ['esri',      new EsriImageryLayer(),       'Esri 卫星',            true],
+        ['terrain',   grid('demTiles', '.png', 15), '腾讯地形',             false]
       ];
 
-      var created = {
-        street:    layers[0][0],
-        dark:      layers[1][0],
-        silver:    layers[2][0],
-        satellite: layers[3][0],
-        hybrid:    layers[4][0],
-        esri:      layers[5][0],
-        terrain:   layers[6][0]
-      };
+      var created = {};
+      layers.forEach(function (item) { created[item[0]] = item[1]; });
 
       // IITC-CE 的图层选择器全局是 window.layerChooser（旧版 IITC 的 layerControl 已不存在）
       var chooser = window.layerChooser || window.layerControl;
@@ -232,7 +257,7 @@ function wrapper(plugin_info) {
       }
       layers.forEach(function (item) {
         // 旧版 layerControl.addBaseLayer 只有两个参数，多余参数会被忽略，安全
-        chooser.addBaseLayer(item[0], item[1], { isDark: item[2] });
+        chooser.addBaseLayer(item[1], item[2], { isDark: item[3] });
       });
 
       // 可选：自动切换为默认底图。

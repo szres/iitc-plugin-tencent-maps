@@ -18,15 +18,33 @@ satellite+roads / terrain) and Esri World Imagery as base layers, using Tencent'
 
 ## 提供的图层
 
-| 图层 | 说明 | 原生最高层级 |
-| --- | --- | --- |
-| 腾讯地图 | 标准矢量底图（styleid=0） | z18 |
-| 腾讯地图（深色） | 深色底图（styleid=3），配合 IITC 暗色主题 | z18 |
-| 腾讯地图（浅灰） | 浅灰底图（styleid=4） | z18 |
-| 腾讯卫星 | 卫星影像（sateTiles） | z18 |
-| 腾讯卫星（路网） | 卫星影像 + 透明路网标注（styleid=2 叠加） | z18 |
-| 腾讯地形 | 地形图（demTiles） | z15 |
-| Esri 卫星 | Esri World Imagery，WGS84 对齐、无需密钥 | z19 |
+| 图层 | 说明 | 瓦片尺寸 | 原生最高层级 |
+| --- | --- | --- | --- |
+| 腾讯地图 | 标准矢量底图（styleid=0） | 跟随屏幕 | z18 |
+| 腾讯地图（大字） | 标准底图，**字号 ×2** | 512px | z18 |
+| 腾讯地图（深色） | 深色底图（styleid=3），配合 IITC 暗色主题 | 跟随屏幕 | z18 |
+| 腾讯地图（深色·大字） | 深色底图，**字号 ×2** | 512px | z18 |
+| 腾讯地图（浅灰） | 浅灰底图（styleid=4） | 跟随屏幕 | z18 |
+| 腾讯卫星 | 卫星影像（sateTiles） | 跟随屏幕 | z18 |
+| 腾讯卫星（路网） | 卫星影像 + 透明路网标注（styleid=2 叠加） | 跟随屏幕 | z18 |
+| 腾讯地形 | 地形图（demTiles） | 跟随屏幕 | z15 |
+| Esri 卫星 | Esri World Imagery，WGS84 对齐、无需密钥 | 跟随屏幕 | z19 |
+
+## 觉得字太小？用「大字」图层
+
+腾讯各层级瓦片都是 256×256，所以**字号观感完全由渲染尺寸（tileSize）决定**：
+
+| 渲染方式 | tileSize | 请求层级 | 字号 | 清晰度 | 用途 |
+| --- | --- | --- | --- | --- | --- |
+| 高清 | 128px | z+1 | **×0.5** | 最锐利 | 高分屏默认 |
+| 原生 | 256px | z | ×1 | 正常 | `HD_TILES = false` |
+| 大字 | 512px | z-1 | **×2** | 略糊 | 「大字」图层 |
+
+注意高清模式是「把下一层级的瓦片缩小一半来显示」，所以瓦片更锐利了，但**字会变成一半大**。
+在 Windows 125%/150% 缩放或 Retina 屏上觉得字小，这是根因。两种解法：
+
+1. 直接选图层里的 **「腾讯地图（大字）」** —— 字号是标准版 2 倍，不受 `HD_TILES` 影响
+2. 或把脚本顶部的 `self.HD_TILES` 改成 `false`，恢复 256px 原生字号
 
 ## 关于坐标偏移（重要）
 
@@ -43,13 +61,14 @@ Esri 卫星图层为 WGS-84 对齐，已标记 `needFixChinaOffset: false`，不
 
 插件默认开启高清瓦片（`HD_TILES = 'auto'`）：在高分屏（`devicePixelRatio > 1.05`，
 即 Windows 125%/150% 缩放、Retina 屏等）上自动请求 z+1 级瓦片并按半尺寸渲染，
-文字清晰度明显提升，代价是瓦片请求数约为 4 倍。
+瓦片请求数约为 4 倍，边缘更锐利——但字号只有一半（见上一节）。
 
 想改行为，编辑脚本顶部：
 
 ```js
-self.HD_TILES = 'auto';  // 'auto' | true | false
-self.AUTO_SELECT = null; // 'street' | 'dark' | 'silver' | 'satellite' | 'hybrid' | 'esri' | 'terrain'
+self.HD_TILES = 'auto';  // 'auto' | true | false（false = 原生 256px，字号 1:1）
+self.AUTO_SELECT = null; // 'street' | 'streetBig' | 'dark' | 'darkBig' | 'silver'
+                         // | 'satellite' | 'hybrid' | 'esri' | 'terrain'
 self.TILE_VERSION = 2232;
 ```
 
@@ -64,6 +83,7 @@ https://rt{s}.map.gtimg.com/tile?z={z}&x={x}&y={y}&styleid={style}&version={ver}
 - 腾讯使用 **TMS 纵坐标**（原点在左下角）：`y = 2^z - y_slippy - 1`
 - 子域选择：`s = (x + y) % 4`
 - `styleid`：`0` 标准、`2` 路网标注（透明底）、`3` 深色、`4` 浅灰、`8` 淡雅、`9` 白灰
+- 各层级瓦片均为 **256×256**，所以放大/缩小渲染不需要额外的 `@2x` 接口
 
 卫星 / 地形为 16×16 分目录结构：
 
@@ -71,6 +91,16 @@ https://rt{s}.map.gtimg.com/tile?z={z}&x={x}&y={y}&styleid={style}&version={ver}
 https://p{s}.map.gtimg.com/sateTiles/{z}/{x>>4}/{y>>4}/{x}_{y}.jpg
 https://p{s}.map.gtimg.com/demTiles/{z}/{x>>4}/{y>>4}/{x}_{y}.png
 ```
+
+渲染尺寸由 `scale` 统一推导，三个参数必须联动，否则会请求到不存在的层级：
+
+```js
+URL z = clamp(地图缩放, minNativeZoom, maxNativeZoom) + zoomOffset
+maxNativeZoom = nativeMax - zoomOffset
+minNativeZoom = nativeMin - zoomOffset
+```
+
+图层只需声明真实的 `nativeMin` / `nativeMax`，其余自动算。
 
 ## 已知限制
 
