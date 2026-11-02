@@ -1,0 +1,352 @@
+// ==UserScript==
+// @id             iitc-plugin-tencent-maps-vectormap@tabris@szres
+// @name           IITC plugin: Tencent Maps vector renderer (腾讯矢量底图·实验)
+// @category       Map Tiles
+// @version        0.1.0.20261103
+// @namespace      tabris@szres
+// @author         tabris@szres
+// @description    Experimental: draws Tencent's JSON vector tiles on canvas so labels stay crisp at any size. 实验性：直接渲染腾讯矢量瓦片，字号可任意放大且始终清晰。
+// @match          https://intel.ingress.com/*
+// @match          https://intel-x.ingress.com/*
+// @match          https://www.ingress.com/intel*
+// @grant          none
+// @license        MIT
+// @homepageURL    https://github.com/szres/iitc-plugin-tencent-maps
+// @supportURL     https://github.com/szres/iitc-plugin-tencent-maps/issues
+// @downloadURL    https://raw.githubusercontent.com/szres/iitc-plugin-tencent-maps/feat/vectormap/iitc-plugin-tencent-maps-vectormap.user.js
+// @updateURL      https://raw.githubusercontent.com/szres/iitc-plugin-tencent-maps/feat/vectormap/iitc-plugin-tencent-maps-vectormap.user.js
+// ==/UserScript==
+
+/* global L, map -- eslint */
+
+// 实验分支：不走栅格瓦片，而是拉腾讯的 JSON 矢量瓦片自己画。
+//
+// 为什么值得做：栅格瓦片只有 256×256，且没有任何 @2x 接口，「大字」只能靠放大 2 倍，
+// 必然发虚。矢量数据是几何 + 文字，字号由我们自己决定，放大后依然锐利。
+//
+// 接口（2026-11 实测）：
+//   https://rt{s}.map.gtimg.com/vector?z={z}&x={x}&y={y}&styleid=0&version={ver}
+//   - TMS 纵坐标（y = 2^z - y_slippy - 1），与栅格瓦片一致
+//   - 返回 JSON：{"ret":0,"features":[[layerId,[x0,y0,dx1,dy1,...],"文字"]]}
+//   - 坐标是 0..256 的瓦片内坐标（允许负值和 >256，表示被裁切的几何）
+//   - 几何是增量编码：首点绝对坐标，其后每两个数是相对上一点的 dx/dy
+//   - 带文字的面要素第三个元素就是文本（POI 名 / 路牌）
+//   - 响应头 access-control-allow-origin: * ，页面内可直接 XHR
+//   - 层级 z6~z18 有数据
+//
+// 已知图层 id（北京 z16 实测推断，非官方文档）：
+//   131094 / 131099 / 131103 / 131336 / 131505  道路（按 id 大小分等级）
+//   196614 / 196622 / 196775                    建筑 / 面要素
+//   655xx / 666xx                               POI 注记（带文字）
+//   262xxx                                      路牌（G1 / S50 之类）
+//
+// 注意：这是实验代码，图层语义是从几何形状反推的，不是官方定义，
+//       配色和等级只求「看起来像」，不追求与腾讯原版一致。
+
+function wrapper(plugin_info) {
+  if (typeof window.plugin !== 'function') window.plugin = function () {};
+
+  plugin_info.buildName = 'local';
+  plugin_info.dateTimeVersion = '2026-11-03-000000';
+  plugin_info.pluginId = 'tencent-maps-vectormap';
+
+  window.plugin.tencentVectorMap = function () {};
+  var self = window.plugin.tencentVectorMap;
+
+  self.TILE_VERSION = 2232;
+  self.TILE_HOST = 'rt';        // rt0..rt3
+  self.STYLE_ID = 0;            // 0 标准 / 3 深色（矢量接口同样吃 styleid）
+  self.NATIVE_MIN = 6;
+  self.NATIVE_MAX = 18;
+
+  // —— 外观 ——
+  self.THEME = {
+    background: '#f7f5f2',
+    building: '#e8e4de',
+    buildingStroke: '#dcd6cd',
+    road: {
+      // 按 layerId 分档：[id, 线宽(px@256), 颜色]
+      major: { ids: [131103, 131126], width: 5.5, color: '#f6d69a' },
+      medium: { ids: [131099], width: 3.5, color: '#fbe6bd' },
+      minor: { ids: [131094], width: 1.6, color: '#ffffff' },
+      path: { ids: [131336, 131505], width: 1.1, color: '#e9e5df' },
+    },
+    label: {
+      size: 12,                 // 字号（tileSize=256 时的像素），想要大字就调这里
+      color: '#333333',
+      halo: '#ffffff',
+      haloWidth: 3,
+      font: '"Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", sans-serif',
+      minGap: 14,               // 两个注记之间的最小间距，避免糊成一团
+    },
+    shield: { size: 10, bg: '#2b7a3d', color: '#ffffff', radius: 3 },
+  };
+
+  self.setup = function () {
+    try {
+      // —— 瓦片坐标换算 ——
+      function requestUrl(z, x, ySlippy, sub) {
+        var yTms = (1 << z) - 1 - ySlippy;
+        return 'https://' + self.TILE_HOST + sub + '.map.gtimg.com/vector'
+          + '?z=' + z + '&x=' + x + '&y=' + yTms
+          + '&styleid=' + self.STYLE_ID + '&version=' + self.TILE_VERSION;
+      }
+
+      // —— 解码：[[layerId,[x0,y0,dx,dy,...],"text"], ...] ——
+      function decodeFeatures(json) {
+        var out = [];
+        var list = (json && json.features) || [];
+        for (var i = 0; i < list.length; i++) {
+          var f = list[i];
+          if (!f || !f[1] || f[1].length < 2) continue;
+          var raw = f[1];
+          var pts = [[raw[0], raw[1]]];
+          var x = raw[0];
+          var y = raw[1];
+          for (var k = 2; k + 1 < raw.length; k += 2) {
+            x += raw[k];
+            y += raw[k + 1];
+            pts.push([x, y]);
+          }
+          out.push({ layer: f[0], pts: pts, text: typeof f[2] === 'string' ? f[2] : null });
+        }
+        return out;
+      }
+
+      function roadStyle(layerId) {
+        var r = self.THEME.road;
+        if (r.major.ids.indexOf(layerId) >= 0) return r.major;
+        if (r.medium.ids.indexOf(layerId) >= 0) return r.medium;
+        if (r.minor.ids.indexOf(layerId) >= 0) return r.minor;
+        if (r.path.ids.indexOf(layerId) >= 0) return r.path;
+        return null;
+      }
+      function isArea(layerId) { return layerId >= 196000 && layerId < 197000; }
+      function isShield(layerId) { return layerId >= 262000 && layerId < 263000; }
+      function isLabel(layerId) { return (layerId >= 65536 && layerId < 67000); }
+
+      // —— 绘制一张瓦片 ——
+      function drawTile(ctx, size, feats) {
+        var T = self.THEME;
+        var k = size / 256; // 瓦片内坐标 -> 画布像素
+
+        ctx.fillStyle = T.background;
+        ctx.fillRect(0, 0, size, size);
+
+        // 1) 面要素（建筑/地块）先铺底
+        for (var i = 0; i < feats.length; i++) {
+          var f = feats[i];
+          if (!isArea(f.layer) || f.pts.length < 3) continue;
+          ctx.beginPath();
+          ctx.moveTo(f.pts[0][0] * k, f.pts[0][1] * k);
+          for (var p = 1; p < f.pts.length; p++) ctx.lineTo(f.pts[p][0] * k, f.pts[p][1] * k);
+          ctx.closePath();
+          ctx.fillStyle = T.building;
+          ctx.fill();
+          ctx.strokeStyle = T.buildingStroke;
+          ctx.lineWidth = 0.6 * k;
+          ctx.stroke();
+        }
+
+        // 2) 道路：按等级从宽到窄画，窄的压在上面
+        var order = [T.road.major, T.road.medium, T.road.minor, T.road.path];
+        for (var oi = 0; oi < order.length; oi++) {
+          var st = order[oi];
+          ctx.strokeStyle = st.color;
+          ctx.lineWidth = st.width * k;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          for (var j = 0; j < feats.length; j++) {
+            var rf = feats[j];
+            if (roadStyle(rf.layer) !== st || rf.pts.length < 2) continue;
+            ctx.beginPath();
+            ctx.moveTo(rf.pts[0][0] * k, rf.pts[0][1] * k);
+            for (var q = 1; q < rf.pts.length; q++) ctx.lineTo(rf.pts[q][0] * k, rf.pts[q][1] * k);
+            ctx.stroke();
+          }
+        }
+
+        // 3) 注记
+        var L2 = T.label;
+        ctx.font = L2.size * k + 'px ' + L2.font;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        var placed = [];
+        function tooClose(px, py) {
+          for (var m = 0; m < placed.length; m++) {
+            var dx = placed[m][0] - px;
+            var dy = placed[m][1] - py;
+            if (dx * dx + dy * dy < L2.minGap * L2.minGap) return true;
+          }
+          return false;
+        }
+        for (var t = 0; t < feats.length; t++) {
+          var lf = feats[t];
+          if (!lf.text || !lf.text.trim() || isShield(lf.layer)) continue;
+          if (!isLabel(lf.layer)) continue;
+          var px = lf.pts[0][0] * k;
+          var py = lf.pts[0][1] * k;
+          if (px < 0 || py < 0 || px > size || py > size) continue;
+          if (tooClose(px, py)) continue;
+          placed.push([px, py]);
+          ctx.lineWidth = L2.haloWidth * k;
+          ctx.strokeStyle = L2.halo;
+          ctx.strokeText(lf.text, px, py);
+          ctx.fillStyle = L2.color;
+          ctx.fillText(lf.text, px, py);
+        }
+
+        // 4) 路牌（G1 / S50 之类）
+        var S = T.shield;
+        ctx.font = 'bold ' + S.size * k + 'px ' + L2.font;
+        for (var s = 0; s < feats.length; s++) {
+          var sf = feats[s];
+          if (!sf.text || !isShield(sf.layer)) continue;
+          var sx = sf.pts[0][0] * k;
+          var sy = sf.pts[0][1] * k;
+          if (sx < 0 || sy < 0 || sx > size || sy > size) continue;
+          var w = ctx.measureText(sf.text).width + 6 * k;
+          var h = (S.size + 5) * k;
+          var r = S.radius * k;
+          ctx.beginPath();
+          ctx.moveTo(sx - w / 2 + r, sy - h / 2);
+          ctx.arcTo(sx + w / 2, sy - h / 2, sx + w / 2, sy + h / 2, r);
+          ctx.arcTo(sx + w / 2, sy + h / 2, sx - w / 2, sy + h / 2, r);
+          ctx.arcTo(sx - w / 2, sy + h / 2, sx - w / 2, sy - h / 2, r);
+          ctx.arcTo(sx - w / 2, sy - h / 2, sx + w / 2, sy - h / 2, r);
+          ctx.closePath();
+          ctx.fillStyle = S.bg;
+          ctx.fill();
+          ctx.fillStyle = S.color;
+          ctx.fillText(sf.text, sx, sy);
+        }
+      }
+
+      // —— Leaflet 图层：每张瓦片一个 canvas ——
+      var cache = {};
+      var TencentVectorLayer = L.GridLayer.extend({
+        options: {
+          tileSize: 256,
+          minZoom: 3,
+          maxZoom: (typeof map !== 'undefined' && map.options && map.options.maxZoom) || 21,
+          minNativeZoom: self.NATIVE_MIN,
+          maxNativeZoom: self.NATIVE_MAX,
+          needFixChinaOffset: true,
+          attribution: '© 腾讯地图',
+          updateWhenIdle: false,
+          keepBuffer: 2,
+        },
+
+        createTile: function (coords, done) {
+          var self2 = this;
+          var size = this.getTileSize().x;
+          var dpr = Math.min(window.devicePixelRatio || 1, 3);
+
+          var canvas = document.createElement('canvas');
+          canvas.width = Math.round(size * dpr);
+          canvas.height = Math.round(size * dpr);
+          canvas.style.width = size + 'px';
+          canvas.style.height = size + 'px';
+
+          var ctx = canvas.getContext('2d');
+          ctx.scale(dpr, dpr);
+
+          var z = this._getZoomForUrl ? this._getZoomForUrl() : coords.z;
+          var key = z + '/' + coords.x + '/' + coords.y;
+
+          function paint(feats) {
+            if (self2._tileRemoved) return;
+            try {
+              drawTile(ctx, size, feats);
+            } catch (e) {
+              console.error('[tencent-vec] draw failed', e);
+            }
+            done(null, canvas);
+          }
+
+          if (cache[key]) return paint(cache[key]);
+
+          // 子域沿用栅格瓦片的 (x + y) % 4 规则
+          var sub = (coords.x + coords.y) % 4;
+          var url = requestUrl(z, coords.x, coords.y, sub);
+
+          var xhr = new XMLHttpRequest();
+          xhr.open('GET', url, true);
+          xhr.timeout = 15000;
+          xhr.onload = function () {
+            if (xhr.status !== 200) return done(new Error('HTTP ' + xhr.status), canvas);
+            var feats = [];
+            try {
+              feats = decodeFeatures(JSON.parse(xhr.responseText));
+            } catch (e) {
+              return done(e, canvas);
+            }
+            cache[key] = feats;
+            paint(feats);
+          };
+          xhr.onerror = function () { done(new Error('network'), canvas); };
+          xhr.ontimeout = function () { done(new Error('timeout'), canvas); };
+          xhr.send();
+
+          return canvas;
+        },
+
+        // 腾讯矢量数据也是 GCJ-02，需要和 fix-china-map-offset 一样的偏移处理。
+        // 那个插件只 patch 了 L.TileLayer，自定义 GridLayer 拿不到，所以这里自己来。
+        _fixCenter: function (center) {
+          if (!this.options.needFixChinaOffset) return center;
+          var fx = window.plugin.fixChinaMapOffset;
+          if (!fx || typeof fx.wgs_gcj !== 'function' || typeof fx.isInChina !== 'function') return center;
+          try {
+            if (!fx.isInChina(center.lat, center.lng)) return center;
+            var g = fx.wgs_gcj(center);
+            return L.latLng(g.lat, g.lng);
+          } catch (e) {
+            return center;
+          }
+        },
+        _getTiledPixelBounds: function (center) {
+          return L.GridLayer.prototype._getTiledPixelBounds.call(this, this._fixCenter(center));
+        },
+        _setZoomTransform: function (level, center, zoom) {
+          return L.GridLayer.prototype._setZoomTransform.call(this, level, this._fixCenter(center), zoom);
+        },
+      });
+
+      var layer = new TencentVectorLayer();
+      layer._tencentMaps = true;
+
+      var chooser = window.layerChooser || window.layerControl;
+      if (!chooser || typeof chooser.addBaseLayer !== 'function') {
+        console.warn('[tencent-vec] 未找到 layerChooser');
+        return;
+      }
+      chooser.addBaseLayer(layer, '腾讯矢量地图（实验）', { isDark: self.STYLE_ID === 3 });
+
+      // 调试入口：控制台里可以改字号后手动触发重绘
+      window.plugin.tencentVectorMap.layer = layer;
+      window.plugin.tencentVectorMap.redraw = function () {
+        cache = {};
+        layer.redraw();
+      };
+    } catch (e) {
+      console.error('[tencent-vec] setup failed: ', e);
+    }
+  };
+
+  var setup = function () {
+    if (typeof self.setup === 'function') self.setup();
+  };
+  setup.info = plugin_info;
+  if (!window.bootPlugins) window.bootPlugins = [];
+  window.bootPlugins.push(setup);
+  if (window.iitcLoaded && typeof setup === 'function') setup();
+}
+
+var script = document.createElement('script');
+var info = {};
+if (typeof GM_info !== 'undefined' && GM_info && GM_info.script) {
+  info.script = { version: GM_info.script.version, name: GM_info.script.name, description: GM_info.script.description };
+}
+script.appendChild(document.createTextNode('(' + wrapper + ')(' + JSON.stringify(info) + ');'));
+(document.body || document.head || document.documentElement).appendChild(script);
