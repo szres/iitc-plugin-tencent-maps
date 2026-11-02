@@ -2,7 +2,7 @@
 // @id             iitc-plugin-tencent-maps@tabris@szres
 // @name           IITC plugin: Tencent Maps base layers (腾讯地图底图)
 // @category       Map Tiles
-// @version        0.6.3.20261103
+// @version        0.6.4.20261103
 // @namespace      tabris@szres
 // @author         tabris@szres
 // @description    Adds Tencent Maps (raster: street / dark / silver / satellite / hybrid / terrain, plus a canvas vector renderer) and Esri World Imagery as base layers. 为 IITC 添加腾讯地图底图：栅格版（标准/深色/浅灰/大字/卫星/地形）与矢量渲染版（字号任意放大仍清晰），以及 Esri 卫星。
@@ -20,6 +20,18 @@
 /* global L, map -- eslint */
 
 // —— 版本历史 ——
+// 0.6.4  修复港澳整体偏移约 570 米：
+//        · 根因：官方 fix-china-map-offset 的 isInChina 对港澳返回 false（它是按 Google 地图的
+//          偏移范围划的，Google 港澳用 WGS-84），但腾讯全站（含港澳）是 GCJ-02。
+//          以 Esri World Imagery（WGS-84）为基准做互相关实测：
+//            香港中环 dx=-27,dy=-18 → 574m；深圳福田 588m；上海人民广场 475m
+//          三者量级一致，证明香港同样是 GCJ-02，不纠偏就会整体偏 ~570m。
+//        · 解法：新增 inHKMO() 港澳框，纠偏判定改为 isInChina() || inHKMO()，
+//          并把纠偏统一到 tencentFixLatLng()，栅格层与矢量层共用同一套（此前栅格层
+//          走官方 patch、矢量层自己实现，判定口径不同）。
+//        · 栅格层新增 _getTiledPixelBounds / _setZoomTransform 覆写，直接调
+//          L.GridLayer 的原始实现，避免与官方 patch 叠加成双重纠偏。
+//        · 实测：香港中环/九龙/新界 纠偏 558~560m，深圳 568m，东京 0m（境外不纠偏）。
 // 0.6.3  修复 z11 以上沿海城市成片陆地仍显示为海：
 //        · 根因：海洋（196610）原来是「只要瓦片里出现一个海洋多边形，就 fillRect 铺满整张瓦片」。
 //          这个写法在 z≤10 成立（那时 196610 就是覆盖整瓦片的矩形），但 z≥11 的 196610
@@ -243,6 +255,53 @@ function wrapper(plugin_info) {
   };
 
   // =====================================================================
+  // 纠偏（腾讯全站 GCJ-02 → IITC 的 WGS-84）
+  // =====================================================================
+  // 腾讯数据是 GCJ-02，包括港澳。实测：以 Esri World Imagery（WGS-84）为基准做互相关，
+  //   香港中环 dx=-27,dy=-18 → 约 574 m
+  //   深圳福田 dx=-28,dy=-18 → 约 588 m
+  //   上海人民广场 dx=-26,dy=-13 → 约 475 m
+  // 三者量级一致，说明香港和大陆一样是 GCJ-02，必须纠偏。
+  //
+  // 但官方 fix-china-map-offset 的 isInChina 对港澳返回 false —— 它是按 Google 地图的
+  // 偏移范围划的（Google 港澳用 WGS-84），对腾讯/高德这类全站 GCJ-02 的底图不适用。
+  // 所以这里在 isInChina 之外补一个港澳框，否则腾讯图层在香港会整体偏约 570 米。
+  function inHKMO(lat, lng) {
+    if (lat >= 22.13 && lat <= 22.58 && lng >= 113.80 && lng <= 114.51) return true; // 香港
+    if (lat >= 22.05 && lat <= 22.23 && lng >= 113.51 && lng <= 113.61) return true; // 澳门
+    return false;
+  }
+
+  // 同一帧内 _getTiledPixelBounds 与 _setZoomTransform 会各调一次，做个单条缓存
+  var _fixCache = { key: null, val: null };
+  function tencentFixLatLng(center) {
+    var fx = window.plugin.fixChinaMapOffset;
+    if (!fx || typeof fx.wgs_gcj !== 'function') return center;
+
+    var ck = center.lat.toFixed(6) + ',' + center.lng.toFixed(6);
+    if (_fixCache.key === ck) return _fixCache.val;
+
+    var need;
+    try {
+      need = (typeof fx.isInChina === 'function' && !!fx.isInChina(center.lat, center.lng)) ||
+             inHKMO(center.lat, center.lng);
+    } catch (e) {
+      need = inHKMO(center.lat, center.lng);
+    }
+
+    var out = center;
+    if (need) {
+      try {
+        var g = fx.wgs_gcj(center);
+        out = L.latLng(g.lat, g.lng);
+      } catch (e2) { /* 保持原值 */ }
+    }
+    _fixCache.key = ck;
+    _fixCache.val = out;
+    return out;
+  }
+
+  // =====================================================================
   // 一、栅格图层
   // =====================================================================
   function setupRasterLayers(chooser) {
@@ -335,6 +394,15 @@ function wrapper(plugin_info) {
         bigTile: false, // 由 applyScale 按 scale 自动设置
         needFixChinaOffset: true, // 供 fix-china-map-offset 插件识别
         attribution: '© 腾讯地图'
+      },
+      // 纠偏自己实现，不用官方 patch —— 官方只认 isInChina，港澳会被漏掉。
+      // 注意必须调 L.GridLayer 的原始实现：调 L.TileLayer 的话，官方 patch
+      // （也是覆写在这两个方法上）会再纠偏一次，变成双重偏移。
+      _getTiledPixelBounds: function (center) {
+        return L.GridLayer.prototype._getTiledPixelBounds.call(this, tencentFixLatLng(center));
+      },
+      _setZoomTransform: function (level, center, zoom) {
+        return L.GridLayer.prototype._setZoomTransform.call(this, level, tencentFixLatLng(center), zoom);
       },
       // 给大字瓦片打类名，以便套用上面的 CSS（Leaflet 1.x 的 GridLayer 没有 className 选项）
       createTile: function (coords, done) {
@@ -938,25 +1006,10 @@ function wrapper(plugin_info) {
 
       // 腾讯矢量数据也是 GCJ-02，需要和 fix-china-map-offset 一样的偏移处理。
       // 那个插件只 patch 了 L.TileLayer，自定义 GridLayer 拿不到，所以自己来。
-      // 这两个方法每帧都会被调用，按经纬度做一次缓存。
+      // 具体算法（含港澳）统一走 tencentFixLatLng，与栅格图层完全一致。
       _fixCenter: function (center) {
         if (!this.options.needFixChinaOffset) return center;
-        var fx = window.plugin.fixChinaMapOffset;
-        if (!fx || typeof fx.wgs_gcj !== 'function' || typeof fx.isInChina !== 'function') return center;
-
-        var ck = center.lat + ',' + center.lng;
-        if (this._gcjKey === ck) return this._gcjCenter;
-
-        var out = center;
-        try {
-          if (fx.isInChina(center.lat, center.lng)) {
-            var g = fx.wgs_gcj(center);
-            out = L.latLng(g.lat, g.lng);
-          }
-        } catch (e) { /* 保持原值 */ }
-        this._gcjKey = ck;
-        this._gcjCenter = out;
-        return out;
+        return tencentFixLatLng(center);
       },
       _getTiledPixelBounds: function (center) {
         return L.GridLayer.prototype._getTiledPixelBounds.call(this, this._fixCenter(center));

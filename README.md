@@ -127,6 +127,21 @@ self.BIG_SHARPEN = true;       // 反锐化掩模，嫌耗性能可关
 
 Esri 卫星图层为 WGS-84 对齐，已标记 `needFixChinaOffset: false`，不会被纠偏，对点更准。
 
+### 港澳为什么需要单独处理
+
+官方插件的 `isInChina` 对**港澳返回 false**（它按 Google 地图的偏移范围划定，而 Google 港澳用
+WGS-84），但腾讯全站包括港澳都是 GCJ-02。以 Esri World Imagery（WGS-84）为基准做互相关实测：
+
+| 位置 | 偏移 | 距离 |
+| --- | --- | --- |
+| 香港中环 | dx=-27, dy=-18 | 574 m |
+| 深圳福田 | dx=-28, dy=-18 | 588 m |
+| 上海人民广场 | dx=-26, dy=-13 | 475 m |
+
+三者量级一致，说明香港同样是 GCJ-02。所以插件在 `isInChina()` 之外补了一个港澳框
+（`inHKMO()`），并把纠偏统一到 `tencentFixLatLng()`，**栅格层与矢量层共用同一套判定**，
+避免两者口径不同而互相错位。
+
 ## 高清瓦片
 
 插件默认开启高清瓦片（`HD_TILES = 'auto'`）：在高分屏（`devicePixelRatio > 1.05`，
