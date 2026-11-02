@@ -3,9 +3,14 @@
 为 [IITC-CE](https://github.com/IITC-CE/ingress-intel-total-conversion)（Ingress Intel Total Conversion）
 添加腾讯地图与 Esri 卫星底图的用户脚本插件。
 
-**IITC plugin: Tencent Maps base layers** — adds Tencent Maps (street / dark / silver / satellite /
-satellite+roads / terrain) and Esri World Imagery as base layers, using Tencent's current
-`rt*.map.gtimg.com/tile` vector tile API.
+一个插件里同时提供**两套渲染方式**：
+
+- **矢量渲染**（推荐）：拉腾讯的 JSON 矢量瓦片，用 canvas 自己画。字号由插件决定，
+  放大后依然清晰，不受腾讯 256px 栅格瓦片的限制。
+- **栅格瓦片**：直接贴腾讯的现成瓦片，加载快、观感与腾讯原版一致，但字号大小固定。
+
+**IITC plugin: Tencent Maps base layers** — adds Tencent Maps as base layers, both as a
+canvas vector renderer and as regular raster tiles, plus Esri World Imagery.
 
 ## 安装
 
@@ -18,21 +23,49 @@ satellite+roads / terrain) and Esri World Imagery as base layers, using Tencent'
 
 ## 提供的图层
 
-| 图层 | 说明 | 瓦片尺寸 | 原生最高层级 |
+| 图层 | 渲染方式 | 说明 | 原生最高层级 |
 | --- | --- | --- | --- |
-| 腾讯地图 | 标准矢量底图（styleid=0） | 跟随屏幕 | z18 |
-| 腾讯地图（大字） | 标准底图，**字号 ×2** | 512px | z18 |
-| 腾讯地图（深色） | 深色底图（styleid=3），配合 IITC 暗色主题 | 跟随屏幕 | z18 |
-| 腾讯地图（突出地铁图） | 深色底图（styleid=3）+ **字号 ×2**，轨道线路更醒目 | 512px | z18 |
-| 腾讯地图（浅灰） | 浅灰底图（styleid=4） | 跟随屏幕 | z18 |
-| 腾讯卫星 | 卫星影像（sateTiles） | 跟随屏幕 | z18 |
-| 腾讯卫星（路网） | 卫星影像 + 透明路网标注（styleid=2 叠加） | 跟随屏幕 | z18 |
-| 腾讯地形 | 地形图（demTiles） | 跟随屏幕 | z15 |
-| Esri 卫星 | Esri World Imagery，WGS84 对齐、无需密钥 | 跟随屏幕 | z19 |
+| **腾讯地图（矢量）** | canvas 矢量 | 推荐。道路分级、水域、绿地、注记、路牌，字号任意放大仍清晰 | z18 |
+| **腾讯地图（矢量·深色）** | canvas 矢量 | 同上，深色配色，配合 IITC 暗色主题 | z18 |
+| 腾讯地图 | 栅格 | 标准底图（styleid=0） | z18 |
+| 腾讯地图（大字） | 栅格 | 标准底图，**字号 ×2** | z18 |
+| 腾讯地图（深色） | 栅格 | 深色底图（styleid=3） | z18 |
+| 腾讯地图（突出地铁图） | 栅格 | 深色底图 + **字号 ×2**，轨道线路更醒目 | z18 |
+| 腾讯地图（浅灰） | 栅格 | 浅灰底图（styleid=4） | z18 |
+| 腾讯卫星 | 栅格 | 卫星影像（sateTiles） | z18 |
+| 腾讯卫星（路网） | 栅格 | 卫星影像 + 透明路网标注（styleid=2 叠加） | z18 |
+| 腾讯地形 | 栅格 | 地形图（demTiles） | z15 |
+| Esri 卫星 | 栅格 | Esri World Imagery，WGS84 对齐、无需密钥 | z19 |
+
+## 矢量渲染版说明
+
+数据源是腾讯的 JSON 矢量瓦片（非标准 MVT）：
+
+```
+https://rt{s}.map.gtimg.com/vector?z={z}&x={x}&y={y}&styleid=0&version={ver}
+```
+
+返回 `{"ret":0,"features":[[layerId,[x0,y0,dx1,dy1,...],"文字"]]}`，坐标是 0..256 的瓦片内坐标，
+几何为增量编码（首点绝对，其后每两点为相对增量）。
+
+图层语义是**逆向推断**的（用已知坐标做点在多边形内判定 + 逐图层渲染比对），非官方文档：
+
+| 图层 id | 含义 |
+| --- | --- |
+| `131xxx` | 道路（id 与缩放级别绑定，按几何长度自动分三级） |
+| `196610` / `196612` | 海洋底 / 陆地 |
+| `196618` / `196614` | 面状水域 / 绿地公园 |
+| `196774` / `196775` | 线状水系（河道） |
+| `196622` 等 | 底层地块 |
+| `655xx` / `666xx` | POI 注记 |
+| `65944` / `65945` | 地铁线路标注（仅文字） |
+| `262xxx` | 真路牌（G4/S3300/X001）与路名字（单汉字逐字排列） |
+
+**已知限制**：地铁只有标注文字，线路几何不在该接口里；建筑轮廓没有独立图层，统一按地块处理。
 
 ## 觉得字太小？用「大字」图层
 
-腾讯各层级瓦片都是 256×256，所以**字号观感完全由渲染尺寸（tileSize）决定**：
+腾讯栅格瓦片各层级都是 256×256，所以**字号观感完全由渲染尺寸（tileSize）决定**：
 
 | 渲染方式 | tileSize | 请求层级 | 字号 | 清晰度 | 用途 |
 | --- | --- | --- | --- | --- | --- |
@@ -41,10 +74,11 @@ satellite+roads / terrain) and Esri World Imagery as base layers, using Tencent'
 | 大字 | 512px | z-1 | **×2** | 略糊 | 「大字」图层 |
 
 注意高清模式是「把下一层级的瓦片缩小一半来显示」，所以瓦片更锐利了，但**字会变成一半大**。
-在 Windows 125%/150% 缩放或 Retina 屏上觉得字小，这是根因。两种解法：
+在 Windows 125%/150% 缩放或 Retina 屏上觉得字小，这是根因。三种解法：
 
-1. 直接选图层里的 **「腾讯地图（大字）」** —— 字号是标准版 2 倍，不受 `HD_TILES` 影响
-2. 或把脚本顶部的 `self.HD_TILES` 改成 `false`，恢复 256px 原生字号
+1. 直接用 **「腾讯地图（矢量）」** —— 字号由插件绘制，放大也不糊（推荐）
+2. 选 **「腾讯地图（大字）」** —— 栅格版，字号 2 倍，不受 `HD_TILES` 影响
+3. 或把脚本顶部的 `self.HD_TILES` 改成 `false`，恢复 256px 原生字号
 
 ### 大字版为什么必然会糊一点
 
@@ -91,8 +125,19 @@ Esri 卫星图层为 WGS-84 对齐，已标记 `needFixChinaOffset: false`，不
 想改行为，编辑脚本顶部：
 
 ```js
+// 矢量渲染
+self.ENABLE_VECTOR = true;      // false = 只注册栅格图层
+self.VEC_PIXEL_RATIO = 2;       // canvas 分辨率倍数，降低可省性能
+self.VEC_CACHE_LIMIT = 240;     // 要素缓存条数上限
+self.VEC_UPDATE_WHEN_IDLE = true; // 拖动/缩放动画期间不取数不绘制
+
+// 栅格
 self.HD_TILES = 'auto';  // 'auto' | true | false（false = 原生 256px，字号 1:1）
-self.AUTO_SELECT = null; // 'street' | 'streetBig' | 'dark' | 'darkBig' | 'silver'
+self.BIG_SCALE = 2;      // 大字图层的放大倍数
+
+// 自动选中（null = 不自动切换）
+self.AUTO_SELECT = null; // 'vector' | 'vectorDark'
+                         // | 'street' | 'streetBig' | 'dark' | 'darkBig' | 'silver'
                          // | 'satellite' | 'hybrid' | 'esri' | 'terrain'
 self.TILE_VERSION = 2232;
 ```
