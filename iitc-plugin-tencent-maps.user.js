@@ -2,7 +2,7 @@
 // @id             iitc-plugin-tencent-maps@tabris@szres
 // @name           IITC plugin: Tencent Maps base layers (腾讯地图底图)
 // @category       Map Tiles
-// @version        0.6.0.20261103
+// @version        0.6.1.20261103
 // @namespace      tabris@szres
 // @author         tabris@szres
 // @description    Adds Tencent Maps (raster: street / dark / silver / satellite / hybrid / terrain, plus a canvas vector renderer) and Esri World Imagery as base layers. 为 IITC 添加腾讯地图底图：栅格版（标准/深色/浅灰/大字/卫星/地形）与矢量渲染版（字号任意放大仍清晰），以及 Esri 卫星。
@@ -20,6 +20,13 @@
 /* global L, map -- eslint */
 
 // —— 版本历史 ——
+// 0.6.1  修复矢量图层在 z10 及以下把陆地画成海洋：
+//        · 根因：腾讯矢量接口低层级（≤z10）的海洋是「铺满整块的底色」（196610 只有 1 个
+//          覆盖全瓦片的矩形），靠陆地多边形 196612 覆盖出来，而那份陆地图层在低层级
+//          有整片缺失（实测深圳东部 22.56,114.30 只命中海洋、无陆地），于是成片陆地变海。
+//          z11 起改为「真实海洋多边形 + 背景即陆地」，数据完整，所以放大后反而正常。
+//        · 解法：新增 VEC_RASTER_BELOW（默认 11），低于该层级直接返回腾讯栅格瓦片，
+//          高层级仍用 canvas 自绘。栅格 styleid 跟随主题（浅色 0 / 深色 3）。
 // 0.6.0  合并栅格版与矢量版为同一个插件：
 //        · 栅格图层（标准/大字/深色/突出地铁图/浅灰/卫星/卫星路网/地形）+ Esri 卫星，全部保留
 //        · 新增矢量渲染图层（浅色/深色）：拉腾讯 JSON 矢量瓦片用 canvas 自绘，字号任意放大不糊
@@ -101,6 +108,14 @@ function wrapper(plugin_info) {
   self.VEC_UPDATE_WHEN_IDLE = true; // 拖动/缩放动画期间不取数不绘制
   self.VEC_NATIVE_MIN = 6;
   self.VEC_NATIVE_MAX = 18;
+
+  // 低于该层级改用腾讯栅格瓦片，不自绘。
+  // 原因：腾讯矢量接口在 z10 及以下的海陆数据不完整 —— 海洋是「铺满整块的底色」，
+  // 靠陆地多边形（196612）覆盖出来，而那份陆地图层在低层级有整片缺失
+  // （实测深圳东部 / 香港北部成片被漏掉，于是陆地显示成海）。
+  // z11 起改用「真实海洋多边形 + 背景即陆地」的画法，数据是完整的。
+  // 设 0 可关闭降级（低层级会重新出现海陆错乱）。
+  self.VEC_RASTER_BELOW = 11;
 
   // 两套配色。dark 同时喂给 IITC 的暗色主题自动切换（isDark）。
   self.VEC_THEMES = {
@@ -815,6 +830,13 @@ function wrapper(plugin_info) {
       },
 
       createTile: function (coords, done) {
+        // 低层级：矢量数据的海陆不可靠（见 VEC_RASTER_BELOW 注释），直接用栅格瓦片。
+        // 返回 <img> 而非 canvas —— Leaflet 的 GridLayer 接受任意元素，
+        // _initTile 会自己补上 leaflet-tile 类和尺寸样式。
+        if (self.VEC_RASTER_BELOW > 0 && coords.z < self.VEC_RASTER_BELOW) {
+          return this._createRasterTile(coords, done);
+        }
+
         var size = this.getTileSize().x;
         var dpr = Math.min(window.devicePixelRatio || 1, self.VEC_PIXEL_RATIO);
         var themeName = this.options.theme;
@@ -865,6 +887,26 @@ function wrapper(plugin_info) {
         xhr.send();
 
         return canvas;
+      },
+
+      // 低层级降级用的栅格瓦片。styleid 跟随主题：0 标准 / 3 深色（PNG 无损）。
+      _createRasterTile: function (coords, done) {
+        var z = coords.z;
+        var size = this.getTileSize().x;
+        var styleid = this.options.theme === 'dark' ? 3 : 0;
+        var sub = (coords.x + coords.y) % 4;
+        var yTms = (1 << z) - 1 - coords.y; // 腾讯栅格同样是 TMS 纵坐标
+        var img = document.createElement('img');
+        img.width = size;
+        img.height = size;
+        img.alt = '';
+        img.draggable = false;
+        img.onload = function () { done(null, img); };
+        img.onerror = function () { done(new Error('raster tile failed'), img); };
+        img.src = 'https://rt' + sub + '.map.gtimg.com/tile'
+          + '?z=' + z + '&x=' + coords.x + '&y=' + yTms
+          + '&styleid=' + styleid + '&version=' + self.TILE_VERSION;
+        return img;
       },
 
       // 瓦片被移出视野时中断未完成的请求，避免拖动过程中堆积无效 XHR
