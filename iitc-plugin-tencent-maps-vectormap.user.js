@@ -2,7 +2,7 @@
 // @id             iitc-plugin-tencent-maps-vectormap@tabris@szres
 // @name           IITC plugin: Tencent Maps vector renderer (腾讯矢量底图·实验)
 // @category       Map Tiles
-// @version        0.2.0.20261103
+// @version        0.2.1.20261103
 // @namespace      tabris@szres
 // @author         tabris@szres
 // @description    Experimental: draws Tencent's JSON vector tiles on canvas so labels stay crisp at any size. 实验性：直接渲染腾讯矢量瓦片，字号可任意放大且始终清晰。
@@ -40,7 +40,8 @@
 //   131xxx            道路（id 跟缩放级别绑定，所以按几何长度自动分级，不写死）
 //   655xx / 666xx     POI 注记
 //   65944 / 65945     地铁线路标注（只有文字，如"6号线"）
-//   262xxx            路牌（G1 / S50）
+//   262xxx            两类：真路牌（G4 / S3300 / X001，字母+数字）与
+//                     路名字（单汉字、沿道路逐字排列，连续要素拼起来才是完整路名）
 //
 // 已知限制：
 //   - 地铁只有标注文字，线路几何不在这个接口里，所以只能画线号标签，画不出线路走向
@@ -149,9 +150,18 @@ function wrapper(plugin_info) {
 
       function isRoad(id) { return id >= 131000 && id < 132000; }
       function isArea(id) { return id >= 196000 && id < 197000; }
-      function isShield(id) { return id >= 262000 && id < 263000; }
       function isSubwayLabel(id) { return id === 65944 || id === 65945; }
       function isSubwayText(t) { return /号线|地铁|轻轨/.test(t); }
+
+      // 262xxx 里混着两类东西，靠文本形态区分：
+      //   真路牌   G4 / S3300 / X001（262163/4/5/7/176 等）→ 画成色块
+      //   路名字   "正" "义" "路"（262173/9、262178~262183 等）→ 逐字排列，拼回路名
+      // 一开始把后者也当路牌，结果每个汉字都变成一个绿方块。
+      // 注意必须整串都是「字母+数字」，否则 "U479商场" 这类 POI 名会被误判成路牌。
+      function isShieldText(t) { return /^[A-Za-z]{1,3}\d+$/.test(t); }
+      function isRoadNameChar(f) {
+        return f.text && f.layer >= 262000 && f.layer < 263000 && !isShieldText(f.text);
+      }
 
       // 面要素按已验证的图层 id 分类
       function areaKind(id) {
@@ -200,10 +210,37 @@ function wrapper(plugin_info) {
         var tiers = roadTiers(feats);
         var roadByTier = [[], [], []];
         var land = [], block = [], green = [], water = [], waterLine = [];
-        var labels = [], shields = [];
+        var labels = [], shields = [], roadNames = [];
 
         for (var i = 0; i < feats.length; i++) {
           var f = feats[i];
+
+          // 路名：腾讯把名字拆成单字、沿道路逐字排列，连续同图层的要素拼起来才是完整名字
+          // （如 正/义/路 三个要素，位置相距约 14 单位）。这里按间距把连续的一串收成一组。
+          if (isRoadNameChar(f)) {
+            var run = [f];
+            var refGap = -1;
+            var j = i + 1;
+            for (; j < feats.length; j++) {
+              var g = feats[j];
+              if (!isRoadNameChar(g) || g.layer !== f.layer) break;
+              var prev = run[run.length - 1].pts[0];
+              var cur = g.pts[0];
+              var d = Math.sqrt((cur[0] - prev[0]) * (cur[0] - prev[0]) + (cur[1] - prev[1]) * (cur[1] - prev[1]));
+              if (refGap < 0) refGap = d;
+              else if (d > refGap * 1.9) break;   // 间距突变，说明是另一条路
+              run.push(g);
+            }
+            if (run.length > 1) {
+              var name = '';
+              for (var rc = 0; rc < run.length; rc++) name += run[rc].text;
+              roadNames.push({ chars: run, text: name });
+              i = j - 1;
+              continue;
+            }
+            // 落单的单字当普通注记处理
+          }
+
           if (isRoad(f.layer)) {
             var t = tiers[f.layer];
             if (t !== undefined && f.pts.length >= 2) roadByTier[t].push(f);
@@ -222,7 +259,7 @@ function wrapper(plugin_info) {
             continue;
           }
           if (f.text) {
-            if (isShield(f.layer)) shields.push(f);
+            if (isShieldText(f.text)) shields.push(f);
             else labels.push(f);
           }
         }
@@ -305,6 +342,42 @@ function wrapper(plugin_info) {
 
         var budget = z >= 13 ? 70 : 30;
         var textH = fs * 1.1;
+
+        // —— 路名 ——
+        // 每个字按它自己的坐标画（腾讯就是这么沿道路排的），所以不需要旋转；
+        // 但碰撞检测要按整组的包围盒算，否则会出现「正义」画了「路」被挤掉。
+        var nameBudget = 20;
+        for (var rn = 0; rn < roadNames.length && nameBudget > 0; rn++) {
+          var grp = roadNames[rn];
+          var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+          for (var ci = 0; ci < grp.chars.length; ci++) {
+            var cpt = grp.chars[ci].pts[0];
+            var cx0 = cpt[0] * k, cy0 = cpt[1] * k;
+            if (cx0 < minX) minX = cx0;
+            if (cx0 > maxX) maxX = cx0;
+            if (cy0 < minY) minY = cy0;
+            if (cy0 > maxY) maxY = cy0;
+          }
+          var gcx = (minX + maxX) / 2, gcy = (minY + maxY) / 2;
+          var gw = (maxX - minX) + fs, gh = (maxY - minY) + textH;
+          // 整组都在瓦片外就不画
+          if (maxX < -fs || minX > size + fs || maxY < -textH || minY > size + textH) continue;
+          if (hits(gcx, gcy, gw, gh)) continue;
+          boxes.push({ x: gcx, y: gcy, w: gw, h: gh });
+          nameBudget--;
+
+          for (var ci2 = 0; ci2 < grp.chars.length; ci2++) {
+            var cch = grp.chars[ci2];
+            var cpx2 = cch.pts[0][0] * k;
+            var cpy2 = cch.pts[0][1] * k;
+            if (cpx2 < -fs || cpx2 > size + fs || cpy2 < -textH || cpy2 > size + textH) continue;
+            ctx.lineWidth = L.haloWidth * k;
+            ctx.strokeStyle = L.halo;
+            ctx.strokeText(cch.text, cpx2, cpy2);
+            ctx.fillStyle = L.color;
+            ctx.fillText(cch.text, cpx2, cpy2);
+          }
+        }
 
         for (var li = 0; li < labels.length && budget > 0; li++) {
           var lf = labels[li];
