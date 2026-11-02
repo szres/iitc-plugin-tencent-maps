@@ -2,7 +2,7 @@
 // @id             iitc-plugin-tencent-maps-vectormap@tabris@szres
 // @name           IITC plugin: Tencent Maps vector renderer (腾讯矢量底图·实验)
 // @category       Map Tiles
-// @version        0.1.1.20261103
+// @version        0.1.2.20261103
 // @namespace      tabris@szres
 // @author         tabris@szres
 // @description    Experimental: draws Tencent's JSON vector tiles on canvas so labels stay crisp at any size. 实验性：直接渲染腾讯矢量瓦片，字号可任意放大且始终清晰。
@@ -272,6 +272,16 @@ function wrapper(plugin_info) {
         }
       }
 
+      // 绘制异常不能往上抛：createTile 抛错会中断 Leaflet 整轮 _update，
+      // 表现就是整片地图空白，而且很难定位。这里兜住，最多是这张瓦片难看。
+      function safeDraw(ctx, size, feats, z, dpr) {
+        try {
+          drawTile(ctx, size, feats, z, dpr);
+        } catch (e) {
+          console.error('[tencent-vec] draw failed', e);
+        }
+      }
+
       // —— 要素缓存（带条数上限，按插入顺序淘汰）——
       var cache = {};
       var cacheKeys = [];
@@ -314,10 +324,13 @@ function wrapper(plugin_info) {
 
           var hit = cache[key];
           if (hit) {
-            // 命中缓存直接重绘。注意这里必须返回 canvas，
-            // 之前写成 return paint(...) 会返回 undefined，Leaflet 拿不到瓦片元素。
-            drawTile(canvas.getContext('2d'), size, hit, z, dpr);
-            done(null, canvas);
+            // 命中缓存直接重绘。两个坑：
+            // ① 必须返回 canvas —— 写成 return paint(...) 会返回 undefined，Leaflet 拿不到瓦片元素；
+            // ② done() 必须异步调 —— Leaflet 的 _addTile 是「先 createTile，再把瓦片登记进
+            //    this._tiles[key]」，同步调 done() 会让 _tileReady 找不到这条记录而直接 return，
+            //    瓦片永远不算 loaded，缩放回来时整片空白。setTimeout(0) 让它排到登记之后。
+            safeDraw(canvas.getContext('2d'), size, hit, z, dpr);
+            setTimeout(function () { done(null, canvas); }, 0);
             return canvas;
           }
 
@@ -337,7 +350,7 @@ function wrapper(plugin_info) {
               return done(e, canvas);
             }
             cachePut(key, feats);
-            drawTile(canvas.getContext('2d'), size, feats, z, dpr);
+            safeDraw(canvas.getContext('2d'), size, feats, z, dpr);
             done(null, canvas);
           };
           xhr.onerror = function () { canvas._xhr = null; done(new Error('network'), canvas); };
