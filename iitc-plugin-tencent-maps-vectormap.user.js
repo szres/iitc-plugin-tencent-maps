@@ -2,7 +2,7 @@
 // @id             iitc-plugin-tencent-maps-vectormap@tabris@szres
 // @name           IITC plugin: Tencent Maps vector renderer (腾讯矢量底图·实验)
 // @category       Map Tiles
-// @version        0.1.0.20261103
+// @version        0.1.1.20261103
 // @namespace      tabris@szres
 // @author         tabris@szres
 // @description    Experimental: draws Tencent's JSON vector tiles on canvas so labels stay crisp at any size. 实验性：直接渲染腾讯矢量瓦片，字号可任意放大且始终清晰。
@@ -42,6 +42,11 @@
 //
 // 注意：这是实验代码，图层语义是从几何形状反推的，不是官方定义，
 //       配色和等级只求「看起来像」，不追求与腾讯原版一致。
+//
+// 性能说明（0.1.1 修）：
+//   初版拖动很卡，原因是三个：①平移动画期间每帧都在新建 canvas + XHR + 解码 + 绘制；
+//   ②要素缓存无上限，长时间浏览内存一直涨；③低层级瓦片要素极多（z6 单瓦片 3800+ 个），
+//   全都画了。现在分别用 updateWhenIdle / CACHE_LIMIT / 按层级取舍 + 注记预算 解决。
 
 function wrapper(plugin_info) {
   if (typeof window.plugin !== 'function') window.plugin = function () {};
@@ -59,18 +64,30 @@ function wrapper(plugin_info) {
   self.NATIVE_MIN = 6;
   self.NATIVE_MAX = 18;
 
+  // —— 性能相关 ——
+  // 每张瓦片是一个独立 canvas，dpr 越大内存和合成开销越高。
+  // 2 已经足够清晰（4K 屏也够），3 会明显吃 GPU 显存。
+  self.PIXEL_RATIO_MAX = 2;
+  // 解码后的要素缓存条数上限。不设上限的话，长时间拖图后内存会一直涨。
+  self.CACHE_LIMIT = 240;
+  // true：平移/缩放动画结束后才加载新瓦片 —— 拖动时不会卡，但松手后有一小段空白。
+  // false：边拖边加载，观感更连续，但每帧都在做 XHR + 解码 + 绘制，低配机器会卡。
+  self.UPDATE_WHEN_IDLE = true;
+
   // —— 外观 ——
   self.THEME = {
     background: '#f7f5f2',
     building: '#e8e4de',
     buildingStroke: '#dcd6cd',
-    road: {
-      // 按 layerId 分档：[id, 线宽(px@256), 颜色]
-      major: { ids: [131103, 131126], width: 5.5, color: '#f6d69a' },
-      medium: { ids: [131099], width: 3.5, color: '#fbe6bd' },
-      minor: { ids: [131094], width: 1.6, color: '#ffffff' },
-      path: { ids: [131336, 131505], width: 1.1, color: '#e9e5df' },
-    },
+    // 道路按「重要度」分三档，而不是写死 layerId。
+    // 原因：腾讯的道路 layerId 是跟缩放级别绑定的 —— z6 主力是 131084，
+    // z12 变成 131103，z16 又是 131094。写死 id 只在某一层级有效。
+    // 这里改成按「同类要素数量」自动判级：同一层级里数量最少的等级最高（主干道）。
+    roadTiers: [
+      { width: 5.5, color: '#f6d69a' }, // 主干
+      { width: 3.2, color: '#fbe6bd' }, // 次干
+      { width: 1.4, color: '#ffffff' }, // 支路
+    ],
     label: {
       size: 12,                 // 字号（tileSize=256 时的像素），想要大字就调这里
       color: '#333333',
@@ -113,23 +130,45 @@ function wrapper(plugin_info) {
         return out;
       }
 
-      function roadStyle(layerId) {
-        var r = self.THEME.road;
-        if (r.major.ids.indexOf(layerId) >= 0) return r.major;
-        if (r.medium.ids.indexOf(layerId) >= 0) return r.medium;
-        if (r.minor.ids.indexOf(layerId) >= 0) return r.minor;
-        if (r.path.ids.indexOf(layerId) >= 0) return r.path;
-        return null;
-      }
       function isArea(layerId) { return layerId >= 196000 && layerId < 197000; }
       function isShield(layerId) { return layerId >= 262000 && layerId < 263000; }
       function isLabel(layerId) { return (layerId >= 65536 && layerId < 67000); }
+      function isRoad(layerId) { return layerId >= 131000 && layerId < 132000; }
+
+      // 道路分级：按「同类要素的平均线段长度」判定，长的 = 主干道。
+      // 两个坑都试过了：
+      //   ①写死 layerId 不行 —— 腾讯的 id 跟缩放级别绑定（z6 主力 131084，z12 是 131103，z16 又变 131094）；
+      //   ②按要素数量排也不行 —— 有些层级主网络本身就是最密集的那一类，会被误判成支路。
+      // 用几何长度是跟层级无关的，稳。
+      function roadTiers(feats) {
+        var stat = {};
+        for (var i = 0; i < feats.length; i++) {
+          var f = feats[i];
+          if (!isRoad(f.layer) || f.pts.length < 2) continue;
+          var s = stat[f.layer] || (stat[f.layer] = { n: 0, len: 0 });
+          s.n++;
+          for (var p = 1; p < f.pts.length; p++) {
+            var dx = f.pts[p][0] - f.pts[p - 1][0];
+            var dy = f.pts[p][1] - f.pts[p - 1][1];
+            s.len += Math.sqrt(dx * dx + dy * dy);
+          }
+        }
+        var ids = Object.keys(stat).map(Number).sort(function (a, b) {
+          return stat[b].len / stat[b].n - stat[a].len / stat[a].n; // 平均长度降序
+        });
+        var tiers = {};
+        for (var k = 0; k < ids.length; k++) tiers[ids[k]] = k === 0 ? 0 : k === 1 ? 1 : 2;
+        return tiers;
+      }
 
       // —— 绘制一张瓦片 ——
-      function drawTile(ctx, size, feats) {
+      function drawTile(ctx, size, feats, z, dpr) {
         var T = self.THEME;
         var k = size / 256; // 瓦片内坐标 -> 画布像素
 
+        // 每次都用 setTransform 重置，避免在复用上下文时缩放叠加
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, size, size);
         ctx.fillStyle = T.background;
         ctx.fillRect(0, 0, size, size);
 
@@ -148,17 +187,25 @@ function wrapper(plugin_info) {
           ctx.stroke();
         }
 
-        // 2) 道路：按等级从宽到窄画，窄的压在上面
-        var order = [T.road.major, T.road.medium, T.road.minor, T.road.path];
-        for (var oi = 0; oi < order.length; oi++) {
-          var st = order[oi];
+        // 2) 道路：先画粗的，细的压在上面
+        var tiers = roadTiers(feats);
+        var roadCount = 0;
+        for (var rc = 0; rc < feats.length; rc++) if (isRoad(feats[rc].layer)) roadCount++;
+        // 要素特别多的时候（z6 这类低层级）直接丢掉最细一档：那个尺度下画出来就是一团糊，
+        // 而且几千条短线段是纯浪费。
+        var skipThin = roadCount > 1500;
+
+        for (var tier = 0; tier < T.roadTiers.length; tier++) {
+          if (skipThin && tier === 2) continue;
+          var st = T.roadTiers[tier];
           ctx.strokeStyle = st.color;
           ctx.lineWidth = st.width * k;
           ctx.lineCap = 'round';
           ctx.lineJoin = 'round';
           for (var j = 0; j < feats.length; j++) {
             var rf = feats[j];
-            if (roadStyle(rf.layer) !== st || rf.pts.length < 2) continue;
+            if (!isRoad(rf.layer) || rf.pts.length < 2) continue;
+            if (tiers[rf.layer] !== tier) continue;
             ctx.beginPath();
             ctx.moveTo(rf.pts[0][0] * k, rf.pts[0][1] * k);
             for (var q = 1; q < rf.pts.length; q++) ctx.lineTo(rf.pts[q][0] * k, rf.pts[q][1] * k);
@@ -172,6 +219,8 @@ function wrapper(plugin_info) {
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         var placed = [];
+        // 每张瓦片的注记预算：低层级要素密集，不限量会拖慢绘制
+        var budget = z >= 13 ? 60 : 25;
         function tooClose(px, py) {
           for (var m = 0; m < placed.length; m++) {
             var dx = placed[m][0] - px;
@@ -180,7 +229,7 @@ function wrapper(plugin_info) {
           }
           return false;
         }
-        for (var t = 0; t < feats.length; t++) {
+        for (var t = 0; t < feats.length && budget > 0; t++) {
           var lf = feats[t];
           if (!lf.text || !lf.text.trim() || isShield(lf.layer)) continue;
           if (!isLabel(lf.layer)) continue;
@@ -189,6 +238,7 @@ function wrapper(plugin_info) {
           if (px < 0 || py < 0 || px > size || py > size) continue;
           if (tooClose(px, py)) continue;
           placed.push([px, py]);
+          budget--;
           ctx.lineWidth = L2.haloWidth * k;
           ctx.strokeStyle = L2.halo;
           ctx.strokeText(lf.text, px, py);
@@ -222,8 +272,18 @@ function wrapper(plugin_info) {
         }
       }
 
-      // —— Leaflet 图层：每张瓦片一个 canvas ——
+      // —— 要素缓存（带条数上限，按插入顺序淘汰）——
       var cache = {};
+      var cacheKeys = [];
+      function cachePut(key, val) {
+        if (!cache[key]) cacheKeys.push(key);
+        cache[key] = val;
+        while (cacheKeys.length > self.CACHE_LIMIT) {
+          delete cache[cacheKeys.shift()];
+        }
+      }
+
+      // —— Leaflet 图层：每张瓦片一个 canvas ——
       var TencentVectorLayer = L.GridLayer.extend({
         options: {
           tileSize: 256,
@@ -233,14 +293,15 @@ function wrapper(plugin_info) {
           maxNativeZoom: self.NATIVE_MAX,
           needFixChinaOffset: true,
           attribution: '© 腾讯地图',
-          updateWhenIdle: false,
-          keepBuffer: 2,
+          // 拖动时不做任何取数/绘制，松手后才补瓦片 —— 这是"卡"与"不卡"的分水岭
+          updateWhenIdle: self.UPDATE_WHEN_IDLE,
+          updateInterval: 150,
+          keepBuffer: 1,
         },
 
         createTile: function (coords, done) {
-          var self2 = this;
           var size = this.getTileSize().x;
-          var dpr = Math.min(window.devicePixelRatio || 1, 3);
+          var dpr = Math.min(window.devicePixelRatio || 1, self.PIXEL_RATIO_MAX);
 
           var canvas = document.createElement('canvas');
           canvas.width = Math.round(size * dpr);
@@ -248,62 +309,75 @@ function wrapper(plugin_info) {
           canvas.style.width = size + 'px';
           canvas.style.height = size + 'px';
 
-          var ctx = canvas.getContext('2d');
-          ctx.scale(dpr, dpr);
-
-          var z = this._getZoomForUrl ? this._getZoomForUrl() : coords.z;
+          var z = coords.z;
           var key = z + '/' + coords.x + '/' + coords.y;
 
-          function paint(feats) {
-            if (self2._tileRemoved) return;
-            try {
-              drawTile(ctx, size, feats);
-            } catch (e) {
-              console.error('[tencent-vec] draw failed', e);
-            }
+          var hit = cache[key];
+          if (hit) {
+            // 命中缓存直接重绘。注意这里必须返回 canvas，
+            // 之前写成 return paint(...) 会返回 undefined，Leaflet 拿不到瓦片元素。
+            drawTile(canvas.getContext('2d'), size, hit, z, dpr);
             done(null, canvas);
+            return canvas;
           }
-
-          if (cache[key]) return paint(cache[key]);
 
           // 子域沿用栅格瓦片的 (x + y) % 4 规则
           var sub = (coords.x + coords.y) % 4;
-          var url = requestUrl(z, coords.x, coords.y, sub);
-
           var xhr = new XMLHttpRequest();
-          xhr.open('GET', url, true);
+          canvas._xhr = xhr;
+          xhr.open('GET', requestUrl(z, coords.x, coords.y, sub), true);
           xhr.timeout = 15000;
           xhr.onload = function () {
+            canvas._xhr = null;
             if (xhr.status !== 200) return done(new Error('HTTP ' + xhr.status), canvas);
-            var feats = [];
+            var feats;
             try {
               feats = decodeFeatures(JSON.parse(xhr.responseText));
             } catch (e) {
               return done(e, canvas);
             }
-            cache[key] = feats;
-            paint(feats);
+            cachePut(key, feats);
+            drawTile(canvas.getContext('2d'), size, feats, z, dpr);
+            done(null, canvas);
           };
-          xhr.onerror = function () { done(new Error('network'), canvas); };
-          xhr.ontimeout = function () { done(new Error('timeout'), canvas); };
+          xhr.onerror = function () { canvas._xhr = null; done(new Error('network'), canvas); };
+          xhr.ontimeout = function () { canvas._xhr = null; done(new Error('timeout'), canvas); };
           xhr.send();
 
           return canvas;
         },
 
+        // 瓦片被移出视野时中断未完成的请求，避免拖动过程中堆积无效 XHR
+        _removeTile: function (key) {
+          var t = this._tiles[key];
+          if (t && t.el && t.el._xhr) {
+            try { t.el._xhr.abort(); } catch (e) { /* 忽略 */ }
+            t.el._xhr = null;
+          }
+          return L.GridLayer.prototype._removeTile.call(this, key);
+        },
+
         // 腾讯矢量数据也是 GCJ-02，需要和 fix-china-map-offset 一样的偏移处理。
         // 那个插件只 patch 了 L.TileLayer，自定义 GridLayer 拿不到，所以这里自己来。
+        // 这两个方法在每一帧都会被调用，所以按经纬度做一次缓存，别重复算。
         _fixCenter: function (center) {
           if (!this.options.needFixChinaOffset) return center;
           var fx = window.plugin.fixChinaMapOffset;
           if (!fx || typeof fx.wgs_gcj !== 'function' || typeof fx.isInChina !== 'function') return center;
+
+          var ck = center.lat + ',' + center.lng;
+          if (this._gcjKey === ck) return this._gcjCenter;
+
+          var out = center;
           try {
-            if (!fx.isInChina(center.lat, center.lng)) return center;
-            var g = fx.wgs_gcj(center);
-            return L.latLng(g.lat, g.lng);
-          } catch (e) {
-            return center;
-          }
+            if (fx.isInChina(center.lat, center.lng)) {
+              var g = fx.wgs_gcj(center);
+              out = L.latLng(g.lat, g.lng);
+            }
+          } catch (e) { /* 保持原值 */ }
+          this._gcjKey = ck;
+          this._gcjCenter = out;
+          return out;
         },
         _getTiledPixelBounds: function (center) {
           return L.GridLayer.prototype._getTiledPixelBounds.call(this, this._fixCenter(center));
@@ -327,6 +401,7 @@ function wrapper(plugin_info) {
       window.plugin.tencentVectorMap.layer = layer;
       window.plugin.tencentVectorMap.redraw = function () {
         cache = {};
+        cacheKeys = [];
         layer.redraw();
       };
     } catch (e) {
