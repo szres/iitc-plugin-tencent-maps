@@ -2,7 +2,7 @@
 // @id             iitc-plugin-tencent-maps-vectormap@tabris@szres
 // @name           IITC plugin: Tencent Maps vector renderer (腾讯矢量底图·实验)
 // @category       Map Tiles
-// @version        0.2.1.20261103
+// @version        0.2.2.20261103
 // @namespace      tabris@szres
 // @author         tabris@szres
 // @description    Experimental: draws Tencent's JSON vector tiles on canvas so labels stay crisp at any size. 实验性：直接渲染腾讯矢量瓦片，字号可任意放大且始终清晰。
@@ -72,10 +72,11 @@ function wrapper(plugin_info) {
   // 两套配色，注册成两个图层。dark 同时喂给 IITC 的暗色主题自动切换（isDark）。
   self.THEMES = {
     light: {
-      background: '#f6f4f0',
+      background: '#f0ece5',
       land: '#f0ece5',
       block: '#e6e2db',
       green: '#cfe4c2',
+      ocean: '#a3ccec',
       water: '#a9d0ee',
       waterLine: '#9cc8e8',
       roadTiers: [
@@ -95,10 +96,11 @@ function wrapper(plugin_info) {
       subway: { size: 10, bg: '#0f7b6c', color: '#ffffff' },
     },
     dark: {
-      background: '#191d22',
+      background: '#212730',
       land: '#212730',
       block: '#282f38',
       green: '#1e3327',
+      ocean: '#0e2a40',
       water: '#12314a',
       waterLine: '#16405e',
       roadTiers: [
@@ -164,11 +166,14 @@ function wrapper(plugin_info) {
       }
 
       // 面要素按已验证的图层 id 分类
+      // 196610 = 覆盖全图的海洋底（离岸点只命中它），196612 = 陆地（陆地两都命中）。
+      // 一开始把这两个都当"底图面"填成米色，结果大海被画成陆地。
       function areaKind(id) {
+        if (id === 196610) return 'ocean';
+        if (id === 196612) return 'land';
         if (id === 196618) return 'water';
         if (id === 196614) return 'green';
         if (id === 196774 || id === 196775) return 'waterLine';
-        if (id === 196610 || id === 196612) return 'land';
         return 'block';
       }
 
@@ -209,7 +214,7 @@ function wrapper(plugin_info) {
         // 一次性分桶，后面不再反复全量扫描
         var tiers = roadTiers(feats);
         var roadByTier = [[], [], []];
-        var land = [], block = [], green = [], water = [], waterLine = [];
+        var hasOcean = false, land = [], block = [], green = [], water = [], waterLine = [];
         var labels = [], shields = [], roadNames = [];
 
         for (var i = 0; i < feats.length; i++) {
@@ -251,7 +256,8 @@ function wrapper(plugin_info) {
             if (kind === 'waterLine') {
               if (f.pts.length >= 2) waterLine.push(f);
             } else if (f.pts.length >= 3) {
-              if (kind === 'water') water.push(f);
+              if (kind === 'ocean') hasOcean = true;
+              else if (kind === 'water') water.push(f);
               else if (kind === 'green') green.push(f);
               else if (kind === 'land') land.push(f);
               else block.push(f);
@@ -278,6 +284,12 @@ function wrapper(plugin_info) {
           ctx.fill();
         }
 
+        // 196610 是覆盖全图的海洋底，按多边形填反而会在瓦片边缘留接缝，
+        // 直接铺满整张瓦片更快也更准；陆地（196612）随后盖在上面。
+        if (hasOcean) {
+          ctx.fillStyle = T.ocean;
+          ctx.fillRect(0, 0, size, size);
+        }
         fillPolys(land, T.land);
         fillPolys(block, T.block);
         fillPolys(green, T.green);
