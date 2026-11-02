@@ -1,0 +1,5 @@
+# 统一用 LF 存储，避免 Windows 下 CRLF 混入
+* text=auto eol=lf
+
+*.user.js text eol=lf
+*.md text eol=lf

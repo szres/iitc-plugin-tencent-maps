@@ -1,0 +1,14 @@
+# WorkBuddy 会话数据（不随仓库发布）
+.workbuddy-ai/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.log
+*.tmp
+node_modules/
