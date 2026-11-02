@@ -2,7 +2,7 @@
 // @id             iitc-plugin-tencent-maps@tabris@szres
 // @name           IITC plugin: Tencent Maps base layers (腾讯地图底图)
 // @category       Map Tiles
-// @version        0.6.1.20261103
+// @version        0.6.2.20261103
 // @namespace      tabris@szres
 // @author         tabris@szres
 // @description    Adds Tencent Maps (raster: street / dark / silver / satellite / hybrid / terrain, plus a canvas vector renderer) and Esri World Imagery as base layers. 为 IITC 添加腾讯地图底图：栅格版（标准/深色/浅灰/大字/卫星/地形）与矢量渲染版（字号任意放大仍清晰），以及 Esri 卫星。
@@ -20,6 +20,13 @@
 /* global L, map -- eslint */
 
 // —— 版本历史 ——
+// 0.6.2  修复矢量图层整层空白（合并 0.6.0 时引入的致命 bug）：
+//        · _setZoomTransform 覆写时漏传了 level 参数，父类收到的是 (center, zoom)，
+//          于是 level 位置成了 LatLng、level.origin 为 undefined，
+//          父类里 level.origin.multiplyBy(...) 抛 TypeError，addTo 直接中断 → 整层白屏。
+//          v0.2.2 实验分支里这行是对的（call(this, level, ...)），合并时弄丢了。
+//        · 已用无头 Chrome + 真实 Leaflet 复现并验证修复：z10 走栅格 8/9 张全部加载，
+//          z12 走 canvas 8 张全部渲染，tileerror=0。
 // 0.6.1  修复矢量图层在 z10 及以下把陆地画成海洋：
 //        · 根因：腾讯矢量接口低层级（≤z10）的海洋是「铺满整块的底色」（196610 只有 1 个
 //          覆盖全瓦片的矩形），靠陆地多边形 196612 覆盖出来，而那份陆地图层在低层级
@@ -945,7 +952,12 @@ function wrapper(plugin_info) {
         return L.GridLayer.prototype._getTiledPixelBounds.call(this, this._fixCenter(center));
       },
       _setZoomTransform: function (level, center, zoom) {
-        return L.GridLayer.prototype._setZoomTransform.call(this, this._fixCenter(center), zoom);
+        // 注意：三个参数一个都不能少。父类实现是
+        //   var scale = map.getZoomScale(zoom, level.zoom),
+        //       translate = level.origin.multiplyBy(scale)...
+        // 合并 0.6.0 时这里漏传了 level，导致 level 位置收到的是 center（LatLng），
+        // level.origin 为 undefined → multiplyBy 抛 TypeError → addTo 中断 → 整层空白。
+        return L.GridLayer.prototype._setZoomTransform.call(this, level, this._fixCenter(center), zoom);
       },
     });
 
