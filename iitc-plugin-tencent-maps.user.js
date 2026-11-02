@@ -2,10 +2,10 @@
 // @id             iitc-plugin-tencent-maps@tabris@szres
 // @name           IITC plugin: Tencent Maps base layers (腾讯地图底图)
 // @category       Map Tiles
-// @version        0.5.0.20261103
+// @version        0.5.3.20261103
 // @namespace      tabris@szres
 // @author         tabris@szres
-// @description    Adds Tencent Maps and Esri World Imagery base layers to IITC: street / dark / silver / satellite / satellite+roads / terrain / Esri satellite, using the current rt*.map.gtimg.com tile API. 为 IITC 添加腾讯地图与 Esri 卫星底图：标准、深色、浅灰、卫星、卫星（路网）、地形、Esri 卫星。使用腾讯地图当前官方瓦片接口 rt*.map.gtimg.com/tile。
+// @description    Adds Tencent Maps (street / dark / silver / satellite / hybrid / terrain) and Esri World Imagery as base layers. 为 IITC 添加腾讯地图与 Esri 卫星底图。
 // @match          https://intel.ingress.com/*
 // @match          https://intel-x.ingress.com/*
 // @match          https://www.ingress.com/intel*
@@ -20,6 +20,14 @@
 /* global L, map -- eslint */
 
 // —— 版本历史 ——
+// 0.5.3  图层「腾讯地图（深色·大字）」更名为「腾讯地图（突出地铁图）」。
+//        注意：仅改显示名，瓦片源没变（仍是 styleid=3 深色底图 + scale=2 放大字号），
+//        内部 key 仍为 darkBig（保持 AUTO_SELECT 配置兼容）。
+// 0.5.2  适配 IITC Community-plugins 目录规范：精简 @description（目录列表会整段展示），
+//        补齐 updateURL/downloadURL（目录构建系统必需）；功能无变化。
+// 0.5.1  优化「大字」图层画质：强制 image-rendering:auto 覆盖 Safari 下的最近邻放大
+//        （锯齿主因），并叠加轻度反锐化掩模（SVG feConvolveMatrix）抵消放大发虚；
+//        新增 BIG_SCALE / BIG_RENDER / BIG_SHARPEN 三个开关，scale 增加 2 的幂校验。
 // 0.5.0  新增「腾讯地图（大字）」「腾讯地图（深色·大字）」图层：tileSize 512 + 请求 z-1，
 //        字号为标准版的 2 倍；瓦片尺寸逻辑重构为统一的 scale 推导
 //        （nativeMin/nativeMax → tileSize / zoomOffset / maxNativeZoom / minNativeZoom），
@@ -88,8 +96,23 @@ function wrapper(plugin_info) {
   // 它固定 scale=2（请求 z-1、按 512px 渲染），字号是标准版的 2 倍，不受本开关影响。
   self.HD_TILES = 'auto';
 
+  // ——「大字」图层的画质取向 ——
+  // 前提：腾讯只提供 256×256 瓦片（实测 15 种 @2x/scl/size/dpi/png 参数全部被忽略），
+  // 所以字号放大 2 倍必然是把 256px 源放大 2 倍，锐度有物理上限。以下三项只能取舍：
+  //
+  //   BIG_SCALE   放大倍数，必须是 2 的整数次幂。默认 2（字号 ×2）；
+  //               4 也能用但 256px 源放大 4 倍会非常糊，不建议。
+  //   BIG_RENDER  'smooth'（默认）双线性插值 —— 边缘柔和，没有硬锯齿，但略糊；
+  //               'crisp'  最近邻 —— 边缘硬，2× 时锯齿明显（只在你能接受锯齿时用）。
+  //   BIG_SHARPEN true（默认）额外叠一层轻微反锐化掩模（SVG 滤镜），
+  //               抵消放大后的发虚，让文字边缘更实；嫌耗性能可设 false。
+  self.BIG_SCALE = 2;
+  self.BIG_RENDER = 'smooth';
+  self.BIG_SHARPEN = true;
+
   // 设为 'street' / 'streetBig' / 'dark' / 'darkBig' / 'silver' /
   //       'satellite' / 'hybrid' / 'esri' / 'terrain'
+  // （darkBig 即图层列表里的「腾讯地图（突出地铁图）」，key 沿用旧名以兼容已有配置）
   // 可在插件加载后自动切换为默认底图；保持 null 则仅在图层选择器中注册，手动选择。
   self.AUTO_SELECT = null;
 
@@ -114,7 +137,16 @@ function wrapper(plugin_info) {
       //   → minNativeZoom = nativeMin - zoomOffset
       // 所以图层只需声明 nativeMin / nativeMax 两个"真实层级上限"，其余自动推导。
       function resolveScale(explicit) {
-        if (typeof explicit === 'number' && explicit > 0) return explicit;
+        if (typeof explicit === 'number' && explicit > 0) {
+          // 只接受 2 的整数次幂：tileSize 与 zoomOffset 必须满足
+          // tileSize = 256 * 2^(-zoomOffset)，否则地图几何会整体错位
+          var lg = Math.log(explicit) / Math.LN2;
+          if (Math.abs(lg - Math.round(lg)) > 1e-6) {
+            console.warn('[tencent-maps] scale 必须是 2 的整数次幂（0.5 / 1 / 2 / 4），已回退为 2');
+            return 2;
+          }
+          return explicit;
+        }
         var dpr = window.devicePixelRatio || 1;
         var hd = (self.HD_TILES === true) ||
                  (self.HD_TILES !== false && dpr > 1.05);
@@ -134,7 +166,41 @@ function wrapper(plugin_info) {
         options.zoomOffset = zoomOffset;
         options.maxNativeZoom = options.nativeMax - zoomOffset;
         options.minNativeZoom = Math.max(0, options.nativeMin - zoomOffset);
+        // 放大渲染的图层要套用"平滑插值 + 轻微锐化"，见 installBigTileStyle()
+        options.bigTile = scale > 1;
         return options;
+      }
+
+      // —— 大字图层的画质处理 ——
+      // 1) image-rendering: auto
+      //    IITC 在 Safari 下给 .leaflet-tile 设了 -webkit-optimize-contrast（最近邻），
+      //    2× 放大时会出硬锯齿，这里对大字瓦片强制覆盖回平滑插值。
+      // 2) SVG 反锐化掩模
+      //    双线性放大后文字边缘会发虚，用 3×3 卷积核（中心 1.6、四邻 -0.15，权重和 = 1）
+      //    做轻度锐化，边缘更实但不会产生明显白边。
+      function installBigTileStyle() {
+        if (document.getElementById('tm-big-tile-style')) return;
+
+        var css = '.leaflet-tile.tm-big-tile{'
+          + 'image-rendering:' + (self.BIG_RENDER === 'crisp' ? '-webkit-optimize-contrast' : 'auto')
+          + ' !important;}';
+
+        if (self.BIG_SHARPEN) {
+          var holder = document.createElement('div');
+          holder.setAttribute('aria-hidden', 'true');
+          holder.style.cssText = 'position:absolute;width:0;height:0;overflow:hidden;pointer-events:none';
+          holder.innerHTML = '<svg width="0" height="0" style="position:absolute">'
+            + '<filter id="tm-big-sharpen" x="0" y="0" width="100%" height="100%">'
+            + '<feConvolveMatrix order="3" preserveAlpha="true" divisor="1"'
+            + ' kernelMatrix="0 -0.15 0 -0.15 1.6 -0.15 0 -0.15 0"/></filter></svg>';
+          (document.body || document.documentElement).appendChild(holder);
+          css += '.leaflet-tile.tm-big-tile{filter:url(#tm-big-sharpen);}';
+        }
+
+        var style = document.createElement('style');
+        style.id = 'tm-big-tile-style';
+        style.appendChild(document.createTextNode(css));
+        (document.head || document.documentElement).appendChild(style);
       }
 
       var TencentTileLayer = L.TileLayer.extend({
@@ -144,8 +210,15 @@ function wrapper(plugin_info) {
           nativeMin: 3,
           nativeMax: 18,
           scale: null, // null = 跟随 HD_TILES 自动判定；2 = 大字；1 = 原生；0.5 = 高清
+          bigTile: false, // 由 applyScale 按 scale 自动设置
           needFixChinaOffset: true, // 供 fix-china-map-offset 插件识别
           attribution: '© 腾讯地图'
+        },
+        // 给大字瓦片打类名，以便套用上面的 CSS（Leaflet 1.x 的 GridLayer 没有 className 选项）
+        createTile: function (coords, done) {
+          var tile = L.TileLayer.prototype.createTile.call(this, coords, done);
+          if (this.options.bigTile) tile.className += ' tm-big-tile';
+          return tile;
         },
         initialize: function (options) {
           options = L.extend({
@@ -230,15 +303,19 @@ function wrapper(plugin_info) {
       ]);
       mark(hybrid); // 组本身也打标记，便于 AUTO_SELECT 判定"这是自己的图层"
 
+      // 大字图层的平滑/锐化 CSS 只需要装一次
+      installBigTileStyle();
+
       // 每项：[key, 图层, 显示名, 是否暗色]
-      // 「大字」版用 scale: 2（tileSize 512 + 请求 z-1），字号是标准版的 2 倍，
-      // 适合高分屏/高分屏缩放后觉得字太小的情况；代价是细节降一层、边缘略糊。
+      // 「大字」版用 scale = BIG_SCALE（默认 2：tileSize 512 + 请求 z-1），
+      // 字号是标准版的 2 倍，适合高分屏/高分屏缩放后觉得字太小的情况；
+      // 代价是细节降一层，画质由 BIG_RENDER / BIG_SHARPEN 两个开关调节。
       // 卫星/地形没有文字标注，放大只会更糊，所以不提供大字版。
       var layers = [
         ['street',    vec(0),                       '腾讯地图',             false],
-        ['streetBig', vec(0, { scale: 2 }),         '腾讯地图（大字）',      false],
+        ['streetBig', vec(0, { scale: self.BIG_SCALE }), '腾讯地图（大字）',      false],
         ['dark',      vec(3),                       '腾讯地图（深色）',      true],
-        ['darkBig',   vec(3, { scale: 2 }),         '腾讯地图（深色·大字）', true],
+        ['darkBig',   vec(3, { scale: self.BIG_SCALE }), '腾讯地图（突出地铁图）', true],
         ['silver',    vec(4),                       '腾讯地图（浅灰）',      false],
         ['satellite', satellite,                    '腾讯卫星',             true],
         ['hybrid',    hybrid,                       '腾讯卫星（路网）',      true],

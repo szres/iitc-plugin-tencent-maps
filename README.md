@@ -23,7 +23,7 @@ satellite+roads / terrain) and Esri World Imagery as base layers, using Tencent'
 | 腾讯地图 | 标准矢量底图（styleid=0） | 跟随屏幕 | z18 |
 | 腾讯地图（大字） | 标准底图，**字号 ×2** | 512px | z18 |
 | 腾讯地图（深色） | 深色底图（styleid=3），配合 IITC 暗色主题 | 跟随屏幕 | z18 |
-| 腾讯地图（深色·大字） | 深色底图，**字号 ×2** | 512px | z18 |
+| 腾讯地图（突出地铁图） | 深色底图（styleid=3）+ **字号 ×2**，轨道线路更醒目 | 512px | z18 |
 | 腾讯地图（浅灰） | 浅灰底图（styleid=4） | 跟随屏幕 | z18 |
 | 腾讯卫星 | 卫星影像（sateTiles） | 跟随屏幕 | z18 |
 | 腾讯卫星（路网） | 卫星影像 + 透明路网标注（styleid=2 叠加） | 跟随屏幕 | z18 |
@@ -45,6 +45,31 @@ satellite+roads / terrain) and Esri World Imagery as base layers, using Tencent'
 
 1. 直接选图层里的 **「腾讯地图（大字）」** —— 字号是标准版 2 倍，不受 `HD_TILES` 影响
 2. 或把脚本顶部的 `self.HD_TILES` 改成 `false`，恢复 256px 原生字号
+
+### 大字版为什么必然会糊一点
+
+实测腾讯**只提供 256×256 瓦片**：`scale` / `scl` / `size` / `dpi` / `hd` / `pixelRatio` /
+`fmt=png` / `@2x` 路径等 15 种写法全部被服务器忽略，返回的都是同一张图（字节数完全一致）。
+所以「视野不变 + 字大 2 倍」只能靠把 256px 源放大 2 倍，锐度有物理上限。
+
+插件做了三件事尽量补救：
+
+| 措施 | 作用 |
+| --- | --- |
+| `image-rendering: auto` | 覆盖 Safari 下 IITC 设的 `-webkit-optimize-contrast`（最近邻放大，锯齿主因） |
+| SVG 反锐化掩模 | 3×3 卷积（中心 1.6 / 四邻 −0.15）抵消双线性放大的发虚，字边缘更实 |
+| 深色版用 PNG 源 | `styleid=3` 返回的是 **PNG 无损**，比 JPEG 的 `styleid=0` 更经得起放大 |
+
+可调开关（脚本顶部）：
+
+```js
+self.BIG_SCALE = 2;            // 放大倍数，必须是 2 的幂（0.5/1/2/4）
+self.BIG_RENDER = 'smooth';    // 'smooth' 平滑无锯齿 | 'crisp' 边缘硬但锯齿明显
+self.BIG_SHARPEN = true;       // 反锐化掩模，嫌耗性能可关
+```
+
+如果更看重锐利度而不是字号，把 `HD_TILES` 设为 `false` 用标准图层会更清楚——
+在 256px 源的限制下，「字大」和「锐利」只能二选一。
 
 ## 关于坐标偏移（重要）
 

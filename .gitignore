@@ -1,6 +1,9 @@
 # WorkBuddy 会话数据（不随仓库发布）
 .workbuddy-ai/
 
+# 提交到 IITC-CE/Community-plugins 的材料，不属于本仓库
+contrib/
+
 # 编辑器 / 系统
 .vscode/
 .idea/
