@@ -2,7 +2,7 @@
 // @id             iitc-plugin-tencent-maps@tabris@szres
 // @name           IITC plugin: Tencent Maps base layers (腾讯地图底图)
 // @category       Map Tiles
-// @version        0.6.2.20261103
+// @version        0.6.3.20261103
 // @namespace      tabris@szres
 // @author         tabris@szres
 // @description    Adds Tencent Maps (raster: street / dark / silver / satellite / hybrid / terrain, plus a canvas vector renderer) and Esri World Imagery as base layers. 为 IITC 添加腾讯地图底图：栅格版（标准/深色/浅灰/大字/卫星/地形）与矢量渲染版（字号任意放大仍清晰），以及 Esri 卫星。
@@ -20,6 +20,15 @@
 /* global L, map -- eslint */
 
 // —— 版本历史 ——
+// 0.6.3  修复 z11 以上沿海城市成片陆地仍显示为海：
+//        · 根因：海洋（196610）原来是「只要瓦片里出现一个海洋多边形，就 fillRect 铺满整张瓦片」。
+//          这个写法在 z≤10 成立（那时 196610 就是覆盖整瓦片的矩形），但 z≥11 的 196610
+//          是真实的局部海洋多边形（实测香港瓦片只占 9%~64%），铺满后凡是含海的瓦片全变海，
+//          而 z≥11 又没有陆地图层（196612）来覆盖 → 沿海陆地整片消失。
+//          放大到出现「不含海洋多边形的瓦片」时才显示陆地，正是「放大后才加载出陆地」。
+//        · 解法：改为按多边形填充海洋（fillPolys(ocean, T.ocean)），与陆地/绿地/水域一致。
+//          z≤10 的整瓦片矩形填出来仍是铺满，行为不变。
+//        · 已验证：无头 Chrome + 真实 Leaflet，z11/z12 香港海陆分明，tileerror=0。
 // 0.6.2  修复矢量图层整层空白（合并 0.6.0 时引入的致命 bug）：
 //        · _setZoomTransform 覆写时漏传了 level 参数，父类收到的是 (center, zoom)，
 //          于是 level 位置成了 LatLng、level.origin 为 undefined，
@@ -549,7 +558,7 @@ function wrapper(plugin_info) {
       // 一次性分桶，后面不再反复全量扫描
       var tiers = roadTiers(feats);
       var roadByTier = [[], [], []];
-      var hasOcean = false, land = [], block = [], green = [], water = [], waterLine = [];
+      var ocean = [], land = [], block = [], green = [], water = [], waterLine = [];
       var labels = [], shields = [], roadNames = [];
 
       for (var i = 0; i < feats.length; i++) {
@@ -591,7 +600,7 @@ function wrapper(plugin_info) {
           if (kind === 'waterLine') {
             if (f.pts.length >= 2) waterLine.push(f);
           } else if (f.pts.length >= 3) {
-            if (kind === 'ocean') hasOcean = true;
+            if (kind === 'ocean') ocean.push(f);
             else if (kind === 'water') water.push(f);
             else if (kind === 'green') green.push(f);
             else if (kind === 'land') land.push(f);
@@ -619,12 +628,13 @@ function wrapper(plugin_info) {
         ctx.fill();
       }
 
-      // 196610 是覆盖全图的海洋底，按多边形填反而会在瓦片边缘留接缝，
-      // 直接铺满整张瓦片更快也更准；陆地（196612）随后盖在上面。
-      if (hasOcean) {
-        ctx.fillStyle = T.ocean;
-        ctx.fillRect(0, 0, size, size);
-      }
+      // 海洋必须按多边形填，绝不能「只要出现就整片铺满」。
+      // 196610 的形态随层级变化：
+      //   z≤10  覆盖整瓦片的矩形（-15..271），铺满 = 按多边形填，两者等价；
+      //   z≥11  是真实的局部海洋多边形（实测香港瓦片只占 9%~64%），
+      //         若整片铺满，凡是含海的瓦片都会变成全海 —— 沿海城市成片陆地消失，
+      //         放大到出现「不含海的瓦片」才恢复正常，正是「放大后才加载出陆地」的原因。
+      fillPolys(ocean, T.ocean);
       fillPolys(land, T.land);
       fillPolys(block, T.block);
       fillPolys(green, T.green);
